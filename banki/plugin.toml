@@ -1,0 +1,14 @@
+id = "dontblameme/banki"
+name = "Banki"
+version = "0.1.0"
+plugin_api = 48
+author = "DontBlameMe"
+license = "MIT"
+dependencies = []
+tags = ["bar", "utility"]
+icon = "wallet"
+description = "A bare Noctalia bar widget scaffold for Banki."
+
+[[widget]]
+id = "banki"
+entry = "bar.luau"

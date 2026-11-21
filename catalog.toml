@@ -1,0 +1,14 @@
+# Noctalia plugin catalog for this source repository. The plugin manager reads
+# it from the source clone to discover plugins without a full checkout.
+[[plugin]]
+id = "dontblameme/banki"
+name = "Banki"
+version = "0.1.0"
+author = "DontBlameMe"
+license = "MIT"
+dependencies = []
+icon = "wallet"
+description = "A bare Noctalia bar widget scaffold for Banki."
+deprecated = false
+plugin_api = 48
+tags = ["bar", "utility"]
