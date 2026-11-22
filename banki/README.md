@@ -92,10 +92,10 @@ today. Left click opens Anki and right click refreshes now.
 
 One Python helper process stays alive for the widget and emits a JSON line on
 each tick. Noctalia stops it when the entry reloads and the next widget runtime
-starts a fresh one. The last good value is kept in memory, and helper errors or
-a missed update show a distinct error state. mtime checks are not used: the SQL
-read is far cheaper than process startup, and the count must still be
-recomputed as time passes.
+starts a fresh one. The last good value stays visible if a later check fails or
+the helper misses an update. mtime checks are not used: the SQL read is far
+cheaper than process startup, and the count must still be recomputed as time
+passes.
 
 ## Icon
 

@@ -7,12 +7,9 @@ local ICON_FILL = "#80C2EE"
 local FIXED = {
   number = ICON_FILL,
   success = "#4CAF50",
-  error = "#F38BA8",
 }
 
 local data
-local errorMessage
-local lastUpdate = 0
 local pollSeconds = 600
 local iconPath = ICON_SOURCE
 local lastIconColor
@@ -28,7 +25,6 @@ local function colors()
   return {
     number = "primary",
     success = FIXED.success,
-    error = "error",
   }
 end
 
@@ -94,16 +90,6 @@ local function render()
   local accent = noctalia.getConfig("follow_accent") ~= false
   local icon = tintIcon(accent and noctalia.getColor("primary") or ICON_FILL)
 
-  if errorMessage then
-    barWidget.setVisible(true)
-    barWidget.render(content({
-      ui.image({ path = icon, width = 16, height = 16, fit = "contain" }),
-      ui.label({ text = "?", color = palette.error }),
-    }))
-    barWidget.setTooltip({ { key = noctalia.tr("tooltip.error"), value = errorMessage } })
-    return
-  end
-
   if not data then
     barWidget.setVisible(true)
     barWidget.render(content({
@@ -150,15 +136,12 @@ local function render()
 end
 
 local function onLine(line)
-  local decoded, err = noctalia.json.decode(line)
+  local decoded = noctalia.json.decode(line)
   if not decoded or decoded.ok ~= true then
-    errorMessage = decoded and decoded.error or err or noctalia.tr("error.helper")
-    data = nil
-  else
-    errorMessage = nil
-    data = decoded
-    lastUpdate = noctalia.nowMs()
+    return
   end
+
+  data = decoded
   render()
 end
 
@@ -176,7 +159,6 @@ local function start()
   end
 
   if not pluginDir then
-    errorMessage = noctalia.tr("error.plugin_dir")
     render()
     return
   end
@@ -191,10 +173,7 @@ local function start()
     shellQuote(lockPath),
   }, " ")
 
-  if not noctalia.runStream(command, onLine) then
-    errorMessage = noctalia.tr("error.stream")
-  end
-  noctalia.setUpdateInterval(pollSeconds * 1000)
+  noctalia.runStream(command, onLine)
   render()
 end
 
@@ -237,14 +216,6 @@ end
 function onIpc(event)
   if event == "refresh" then
     refreshNow()
-  end
-end
-
-function update()
-  if not errorMessage and data and noctalia.nowMs() - lastUpdate > pollSeconds * 2000 then
-    errorMessage = noctalia.tr("error.stale")
-    data = nil
-    render()
   end
 end
 
