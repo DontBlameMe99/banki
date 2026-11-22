@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Emit Anki due counts as JSON lines for the Banki bar widget."""
 
+import contextlib
 import glob
 import io
 import fcntl
 import json
 import os
 import pickle
+import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -141,8 +144,9 @@ def sync_collection(path, key_path, lock_path=""):
             finally:
                 col.close()
         except Exception as error:
-            if "locked" in str(error).lower() or "already open" in str(error).lower():
-                raise RuntimeError("Anki is open; close it before syncing") from error
+            message = str(error).lower()
+            if "locked" in message or "already open" in message:
+                return False
             raise
     finally:
         if lock:
@@ -215,10 +219,45 @@ def extract_sync_key(profile=None):
         raise RuntimeError("multiple profiles have sync keys; pass a profile name")
     return candidates[0][1]
 
-def sample(path, include_new, now):
+
+def open_readonly(path):
     uri = Path(path).absolute().as_uri() + "?mode=ro"
     con = sqlite3.connect(uri, uri=True, timeout=1)
     try:
+        con.execute("select 1 from col limit 1").fetchone()
+    except sqlite3.OperationalError:
+        con.close()
+        raise
+    return con
+
+
+@contextlib.contextmanager
+def collection_connection(path):
+    try:
+        con = open_readonly(path)
+    except sqlite3.OperationalError as error:
+        if "locked" not in str(error).lower():
+            raise
+        with tempfile.TemporaryDirectory(prefix="banki-") as directory:
+            target = Path(directory) / Path(path).name
+            for suffix in ("", "-wal"):
+                source = Path(str(path) + suffix)
+                if source.exists():
+                    shutil.copyfile(source, str(target) + suffix)
+            con = sqlite3.connect(target, timeout=1)
+            try:
+                yield con
+            finally:
+                con.close()
+        return
+    try:
+        yield con
+    finally:
+        con.close()
+
+
+def sample(path, include_new, now):
+    with collection_connection(path) as con:
         days, next_day = timing(con, now)
         reviews, day_learning, learning, new = con.execute(
             """
@@ -235,8 +274,6 @@ def sample(path, include_new, now):
             "SELECT count(*) FROM revlog WHERE id >= ? AND type BETWEEN 0 AND 3",
             ((next_day - 86400) * 1000,),
         ).fetchone()[0]
-    finally:
-        con.close()
 
     if not include_new:
         new = 0

@@ -4,7 +4,8 @@
 
 A Noctalia bar widget that reads due Anki cards from a local collection. It
 shows the number learnable right now from the local collection.
-Anki does not need to run. AnkiWeb sync is optional.
+Anki does not need to run, and the widget also works while Anki is open.
+AnkiWeb sync is optional.
 
 ## Install
 
