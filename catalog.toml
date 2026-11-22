@@ -3,7 +3,7 @@
 [[plugin]]
 id = "dontblameme/banki"
 name = "Banki"
-version = "0.2.2"
+version = "0.2.3"
 author = "DontBlameMe"
 license = "MIT"
 dependencies = []
