@@ -2,7 +2,8 @@
 
 Banki is a Noctalia bar widget that shows how many local Anki cards are
 learnable right now. It reads `collection.anki2` through a read-only SQLite
-connection. Anki does not need to run. By default, no AnkiWeb account is used.
+connection. Anki does not need to run, and it works while Anki is open. By
+default, no AnkiWeb account is used.
 
 ![Banki](thumbnail.webp)
 
@@ -30,9 +31,9 @@ learn-ahead window would show them.
 The widget counts all decks, not only the deck currently open in Anki. Day
 boundaries follow Anki's v2 scheduler settings in the collection, including
 rollover hour, creation offset, and daylight saving changes. The helper opens
-the database read-only and never writes to it. Anki uses an exclusive lock, so
-counts may be unavailable while Anki is open; the widget shows an error state
-and recovers when Anki releases the collection.
+the database read-only and never writes to it. While Anki holds its exclusive
+lock, the helper reads a temporary copy of the collection and its write-ahead
+log, so refreshes keep working and include reviews from the open session.
 
 Completed work is the number of revlog answer events since the Anki day started,
 excluding manual and rescheduled entries. Total today is completed work plus the
@@ -81,8 +82,8 @@ On NixOS with the Anki home module, the key is usually already at
 `/run/secrets/anki/sync-key`. The `key` command checks that file first, then the
 profile prefs.
 
-Sync cannot run while Anki holds the collection open. The widget shows its error
-state until Anki releases it.
+When Anki is open, the widget skips its sync step and lets Anki manage syncing.
+It still refreshes counts from the open collection.
 
 The tooltip lists reviews due now, learning due now, completed today, and total
 today. Left click opens Anki and right click refreshes now.
