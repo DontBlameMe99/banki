@@ -47,7 +47,7 @@ label_key = "settings.refresh_seconds.label"
 description_key = "settings.refresh_seconds.description"
 default = 600
 min = 5
-max = 600
+max = 1195
 
 [[setting]]
 key = "include_new"
