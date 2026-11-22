@@ -59,8 +59,9 @@ Sync is off by default. When enabled, the helper syncs the local collection
 before each check, so changes made on another device appear without opening
 Anki. It needs network access and an AnkiWeb sync key. Put the key in the sync
 key setting, or point the key file setting at a secret managed by sops. The key
-file takes precedence. A full download is accepted automatically; a full upload
-shows an error so local data is not overwritten by mistake.
+file takes precedence. A full download is accepted automatically. A full upload
+requires a decision in Anki; the widget keeps showing the last known count until
+a check succeeds.
 
 The sync controls are plugin settings under Settings → Plugins → Banki, not
 bar-widget settings.
@@ -92,10 +93,10 @@ today. Left click opens Anki and right click refreshes now.
 
 One Python helper process stays alive for the widget and emits a JSON line on
 each tick. Noctalia stops it when the entry reloads and the next widget runtime
-starts a fresh one. The last good value is kept in memory, and helper errors or
-a missed update show a distinct error state. mtime checks are not used: the SQL
-read is far cheaper than process startup, and the count must still be
-recomputed as time passes.
+starts a fresh one. The last good value stays visible if a later check fails or
+the helper misses an update. mtime checks are not used: the SQL read is far
+cheaper than process startup, and the count must still be recomputed as time
+passes.
 
 ## Icon
 

@@ -44,13 +44,6 @@
     "new": "New (no deck limits)",
     "completed": "Completed today",
     "total": "Total today",
-    "waiting": "Waiting for Anki data",
-    "error": "Anki data unavailable"
-  },
-  "error": {
-    "helper": "Could not read Anki data",
-    "plugin_dir": "Plugin directory unavailable",
-    "stream": "Could not start the Anki helper",
-    "stale": "No recent update from the Anki helper"
+    "waiting": "Waiting for Anki data"
   }
 }
