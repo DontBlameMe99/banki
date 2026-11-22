@@ -1,6 +1,6 @@
 id = "dontblameme/banki"
 name = "Banki"
-version = "0.1.0"
+version = "0.2.0"
 plugin_api = 48
 author = "DontBlameMe"
 license = "MIT"
