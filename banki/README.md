@@ -40,9 +40,9 @@ remaining count.
 
 ## Settings
 
-Collection path and refresh interval are plugin settings under Settings →
-Plugins → Banki. Icon, number, completion visibility, accent colors, and new
-cards are bar-widget settings.
+Collection path, refresh interval, and include new cards are plugin settings
+under Settings → Plugins → Banki. Icon, number, completion visibility, and
+accent colors are bar-widget settings.
 
 Collection path selects `collection.anki2` or its profile folder. Leave it empty
 to use the only profile under `~/.local/share/Anki2`. Refresh interval defaults

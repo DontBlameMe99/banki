@@ -49,6 +49,14 @@ default = 600
 min = 5
 max = 600
 
+[[setting]]
+key = "include_new"
+type = "bool"
+label_key = "settings.include_new.label"
+description_key = "settings.include_new.description"
+default = false
+advanced = true
+
 [[widget]]
 id = "banki"
 entry = "bar.luau"
@@ -82,11 +90,4 @@ label_key = "settings.follow_accent.label"
 description_key = "settings.follow_accent.description"
 default = true
 
-[[widget.setting]]
-key = "include_new"
-type = "bool"
-label_key = "settings.include_new.label"
-description_key = "settings.include_new.description"
-default = false
-advanced = true
 
