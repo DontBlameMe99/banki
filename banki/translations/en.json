@@ -1,1 +1,56 @@
-{}
+{
+  "settings": {
+    "collection_path": {
+      "label": "Collection path",
+      "description": "Path to collection.anki2 or its profile folder. Leave empty to use the only Anki profile under ~/.local/share/Anki2."
+    },
+    "refresh_seconds": {
+      "label": "Refresh interval",
+      "description": "Seconds between checks, 600 by default. Cards due later still become due between checks."
+    },
+    "hide_icon": {
+      "label": "Hide icon"
+    },
+    "hide_text": {
+      "label": "Hide number"
+    },
+    "hide_on_complete": {
+      "label": "Hide on complete"
+    },
+    "follow_accent": {
+      "label": "Follow accent colors",
+      "description": "Tints the Anki icon, number, and fill from the palette. Off uses Anki blue."
+    },
+    "include_new": {
+      "label": "Include new cards",
+      "description": "Counts every new card. Anki deck limits are not applied, so this is an upper bound."
+    },
+    "sync_enabled": {
+      "label": "Sync with AnkiWeb",
+      "description": "Sync the local collection before each check. Needs an AnkiWeb sync key and network access."
+    },
+    "sync_key": {
+      "label": "AnkiWeb sync key",
+      "description": "Private sync key used only when sync is enabled. Stored in Noctalia settings."
+    },
+    "sync_key_file": {
+      "label": "AnkiWeb sync key file",
+      "description": "Read the key from this file instead of the setting above. Useful with sops-managed secrets."
+    }
+  },
+  "tooltip": {
+    "reviews": "Reviews due now",
+    "learning": "Learning due now",
+    "new": "New (no deck limits)",
+    "completed": "Completed today",
+    "total": "Total today",
+    "waiting": "Waiting for Anki data",
+    "error": "Anki data unavailable"
+  },
+  "error": {
+    "helper": "Could not read Anki data",
+    "plugin_dir": "Plugin directory unavailable",
+    "stream": "Could not start the Anki helper",
+    "stale": "No recent update from the Anki helper"
+  }
+}

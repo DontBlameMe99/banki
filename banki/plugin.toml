@@ -7,8 +7,87 @@ license = "MIT"
 dependencies = []
 tags = ["bar", "utility"]
 icon = "wallet"
-description = "A bare Noctalia bar widget scaffold for Banki."
+description = "Anki due-card count with daily totals for the Noctalia bar."
+
+[[setting]]
+key = "sync_enabled"
+type = "bool"
+label_key = "settings.sync_enabled.label"
+description_key = "settings.sync_enabled.description"
+default = false
+
+[[setting]]
+key = "sync_key"
+type = "string"
+label_key = "settings.sync_key.label"
+description_key = "settings.sync_key.description"
+default = ""
+secret = true
+advanced = true
+
+[[setting]]
+key = "sync_key_file"
+type = "file"
+label_key = "settings.sync_key_file.label"
+description_key = "settings.sync_key_file.description"
+default = ""
+advanced = true
+
+[[setting]]
+key = "collection_path"
+type = "string"
+label_key = "settings.collection_path.label"
+description_key = "settings.collection_path.description"
+default = ""
+
+[[setting]]
+key = "refresh_seconds"
+type = "int"
+label_key = "settings.refresh_seconds.label"
+description_key = "settings.refresh_seconds.description"
+default = 600
+min = 5
+max = 600
+
+[[setting]]
+key = "include_new"
+type = "bool"
+label_key = "settings.include_new.label"
+description_key = "settings.include_new.description"
+default = false
+advanced = true
 
 [[widget]]
 id = "banki"
 entry = "bar.luau"
+[widget.actions]
+left = "exec anki"
+
+
+
+[[widget.setting]]
+key = "hide_icon"
+type = "bool"
+label_key = "settings.hide_icon.label"
+default = false
+
+[[widget.setting]]
+key = "hide_text"
+type = "bool"
+label_key = "settings.hide_text.label"
+default = false
+
+[[widget.setting]]
+key = "hide_on_complete"
+type = "bool"
+label_key = "settings.hide_on_complete.label"
+default = false
+
+[[widget.setting]]
+key = "follow_accent"
+type = "bool"
+label_key = "settings.follow_accent.label"
+description_key = "settings.follow_accent.description"
+default = true
+
+

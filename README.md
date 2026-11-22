@@ -2,7 +2,9 @@
 
 ![Banki](banki/thumbnail.webp)
 
-A bare Noctalia bar widget plugin. The widget code is intentionally empty for now.
+A Noctalia bar widget that reads due Anki cards from a local collection. It
+shows the number learnable right now from the local collection.
+Anki does not need to run. AnkiWeb sync is optional.
 
 ## Install
 
@@ -11,7 +13,10 @@ noctalia msg plugins source add banki git https://github.com/DontBlameMeDev/bank
 noctalia msg plugins enable dontblameme/banki
 ```
 
-See [banki/README.md](banki/README.md) for the manifest details.
+Then add `dontblameme/banki:banki` to a bar.
+
+See [banki/README.md](banki/README.md) for behavior, settings, and performance
+notes.
 
 ## Development
 
