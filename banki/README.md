@@ -59,8 +59,9 @@ Sync is off by default. When enabled, the helper syncs the local collection
 before each check, so changes made on another device appear without opening
 Anki. It needs network access and an AnkiWeb sync key. Put the key in the sync
 key setting, or point the key file setting at a secret managed by sops. The key
-file takes precedence. A full download is accepted automatically; a full upload
-shows an error so local data is not overwritten by mistake.
+file takes precedence. A full download is accepted automatically. A full upload
+requires a decision in Anki; the widget keeps showing the last known count until
+a check succeeds.
 
 The sync controls are plugin settings under Settings → Plugins → Banki, not
 bar-widget settings.
