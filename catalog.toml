@@ -1,14 +1,14 @@
 # Noctalia plugin catalog for this source repository. The plugin manager reads
 # it from the source clone to discover plugins without a full checkout.
 [[plugin]]
-id = "dontblameme/banki"
-name = "Banki"
-version = "0.2.4"
-author = "DontBlameMe"
-license = "MIT"
+id           = "dontblameme/banki"
+name         = "Banki"
+version      = "0.2.4"
+author       = "DontBlameMe"
+license      = "MIT"
 dependencies = []
-icon = "wallet"
-description = "Anki due-card count with daily totals for the Noctalia bar."
-deprecated = false
-plugin_api = 48
-tags = ["bar", "utility"]
+icon         = "sparkles"
+description  = "Anki due-card count with daily totals for the Noctalia bar."
+deprecated   = false
+plugin_api   = 48
+tags         = ["bar", "utility"]
