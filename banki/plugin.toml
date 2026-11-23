@@ -6,7 +6,7 @@ author = "DontBlameMe"
 license = "MIT"
 dependencies = []
 tags = ["bar", "utility"]
-icon = "wallet"
+icon = "sparkles"
 description = "Anki due-card count with daily totals for the Noctalia bar."
 
 [[setting]]
