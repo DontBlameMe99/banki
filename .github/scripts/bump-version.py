@@ -7,7 +7,7 @@ from pathlib import Path
 
 BUMP = sys.argv[1]
 FILES = (Path("banki/plugin.toml"), Path("catalog.toml"))
-PATTERN = re.compile(r'^version = "(\d+)\.(\d+)\.(\d+)"$', re.MULTILINE)
+PATTERN = re.compile(r'^(version\s*=\s*)"(\d+)\.(\d+)\.(\d+)"$', re.MULTILINE)
 
 if BUMP not in ("major", "minor", "patch"):
     raise SystemExit(f"unknown bump: {BUMP}")
@@ -16,7 +16,7 @@ matches = {path: PATTERN.search(path.read_text()) for path in FILES}
 if any(match is None for match in matches.values()):
     raise SystemExit("version line not found in plugin.toml or catalog.toml")
 
-versions = {(m.group(1), m.group(2), m.group(3)) for m in matches.values() if m}
+versions = {(m.group(2), m.group(3), m.group(4)) for m in matches.values() if m}
 if len(versions) != 1:
     raise SystemExit("plugin.toml and catalog.toml versions differ")
 
@@ -30,6 +30,6 @@ else:
 
 new = f"{major}.{minor}.{patch}"
 for path in FILES:
-    path.write_text(PATTERN.sub(f'version = "{new}"', path.read_text(), count=1))
+    path.write_text(PATTERN.sub(lambda m: f'{m.group(1)}"{new}"', path.read_text(), count=1))
 
 print(new)
