@@ -99,9 +99,13 @@ today. Left click opens Anki and right click refreshes now.
 One Rust helper process stays alive per widget instance. The helper queries
 SQLite only when a refresh is due. Noctalia starts it through the noctalia-rs
 bridge, which waits on filesystem events. An idle instance uses about 0.00% of
-one core. The helper uses about 3 MB resident and 1 MB proportional memory, and
-a refresh round trip takes about 0.75 ms. The last good value stays visible if
-a later check fails.
+one core.
+
+The helper keeps one read-only SQLite connection and indexes card due times in
+memory. It rebuilds the index when the collection changes. An unchanged refresh
+on a 50,000-card fixture takes about 0.01 ms, down from 5.5 ms before the cache.
+The first refresh after startup or after an Anki write still reads the card
+table once. The last good value stays visible if a later check fails.
 
 Sync runs in a short-lived Python process only when enabled, so Anki's package
 is not kept resident between checks.

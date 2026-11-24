@@ -425,14 +425,20 @@ fn command_bench(args: &[String]) -> ExitCode {
         }
     };
     let now = anki::now_seconds();
-    let mut samples = Vec::with_capacity(iterations);
-    for _ in 0..iterations {
+    let mut samples = Vec::with_capacity(iterations.saturating_sub(1));
+    let mut first = 0.0;
+    for index in 0..iterations {
         let start = Instant::now();
         if let Err(error) = anki::sample(&path, include_new, now) {
             eprintln!("{error}");
             return ExitCode::FAILURE;
         }
-        samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
+        let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0;
+        if index == 0 {
+            first = elapsed;
+        } else {
+            samples.push(elapsed);
+        }
     }
     samples.sort_by(f64::total_cmp);
     let at = |percent: usize| {
@@ -445,8 +451,9 @@ fn command_bench(args: &[String]) -> ExitCode {
         samples.get(index).copied().unwrap_or(0.0)
     };
     println!(
-        "n={} median={:.1}us p95={:.1}us min={:.1}us max={:.1}us",
+        "n={} first={:.1}us median={:.1}us p95={:.1}us min={:.1}us max={:.1}us",
         samples.len(),
+        first,
         at(50),
         at(95),
         samples.first().copied().unwrap_or(0.0),

@@ -2,9 +2,12 @@ use std::env;
 use std::error::Error as StdError;
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::result::Result as StdResult;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{FixedOffset, Local, TimeZone};
@@ -35,6 +38,160 @@ struct Query {
     current_west: i64,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+struct CollectionConfig {
+    crt: i64,
+    rollover: i64,
+    creation_offset: Option<String>,
+    scheduler_one: bool,
+}
+
+impl CollectionConfig {
+    fn read(conn: &Connection) -> Result<Self> {
+        let crt =
+            conn.query_row("SELECT crt FROM col", [], |row| row.get(0))?;
+        let rollover = match config(conn, "rollover")? {
+            Some(value) if !value.is_empty() => value.parse::<i64>()?,
+            _ => 4,
+        };
+        Ok(Self {
+            crt,
+            rollover,
+            creation_offset: config(conn, "creationOffset")?,
+            scheduler_one: config(conn, "schedVer")?.as_deref() == Some("1"),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct CollectionIdentity {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn collection_identity(path: &Path) -> io::Result<CollectionIdentity> {
+    let metadata = fs::metadata(path)?;
+    Ok(CollectionIdentity {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    })
+}
+
+#[derive(Default)]
+struct CardIndex {
+    reviews: Vec<i64>,
+    day_learning: Vec<i64>,
+    intraday_learning: Vec<i64>,
+    new: i64,
+}
+
+impl CardIndex {
+    fn from_conn(conn: &Connection) -> Result<Self> {
+        let mut index = Self::default();
+        let mut stmt =
+            conn.prepare("SELECT queue, due FROM cards WHERE queue >= 0")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (queue, due) = row?;
+            index.add(queue, due);
+        }
+        index.reviews.sort_unstable();
+        index.day_learning.sort_unstable();
+        index.intraday_learning.sort_unstable();
+        Ok(index)
+    }
+
+    fn counts(&self, days: i64, now: i64) -> (i64, i64, i64, i64) {
+        (
+            count_at(&self.reviews, days),
+            count_at(&self.day_learning, days),
+            count_at(&self.intraday_learning, now),
+            self.new,
+        )
+    }
+}
+
+impl CardIndex {
+    fn add(&mut self, queue: i64, due: i64) {
+        match queue {
+            0 => self.new = self.new.saturating_add(1),
+            1 => self.intraday_learning.push(due),
+            2 => self.reviews.push(due),
+            3 => self.day_learning.push(due),
+            _ => {}
+        }
+    }
+}
+
+fn count_at(due: &[i64], limit: i64) -> i64 {
+    i64::try_from(due.partition_point(|value| *value <= limit))
+        .unwrap_or(i64::MAX)
+}
+
+struct SampleData {
+    config: CollectionConfig,
+    cards: CardIndex,
+}
+
+impl SampleData {
+    fn from_conn(conn: &Connection) -> Result<Self> {
+        Ok(Self {
+            config: CollectionConfig::read(conn)?,
+            cards: CardIndex::from_conn(conn)?,
+        })
+    }
+
+    fn sample(&self, conn: &Connection, query: Query) -> Result<Data> {
+        let (days, next_day) =
+            timing_from(&self.config, query.now, query.current_west)?;
+        let (reviews, day_learning, intraday_learning, mut new) =
+            self.cards.counts(days, query.now);
+        let completed = completed_count(conn, next_day)?;
+
+        if !query.include_new {
+            new = 0;
+        }
+        let learning = intraday_learning.saturating_add(day_learning);
+        let remaining = reviews.saturating_add(learning).saturating_add(new);
+        Ok(Data {
+            reviews,
+            learning,
+            new,
+            remaining,
+            completed,
+            total: remaining.saturating_add(completed),
+            at: query.now,
+        })
+    }
+}
+
+struct Cache {
+    path: PathBuf,
+    identity: CollectionIdentity,
+    version: i64,
+    conn: Connection,
+    data: SampleData,
+}
+
+static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+
+fn cache_lock() -> MutexGuard<'static, Option<Cache>> {
+    CACHE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn data_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA data_version", [], |row| row.get(0))?)
+}
 pub fn now_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -122,11 +279,69 @@ pub fn sample(path: &Path, include_new: bool, now: i64) -> Result<Data> {
         now,
         current_west: current_west(now).ok_or("invalid current time")?,
     };
-    match open_readonly(path) {
-        Ok(conn) => sample_connection(&conn, query),
-        Err(error) if is_locked(&error) => sample_copy(path, query),
-        Err(error) => Err(error.into()),
+    match sample_with_cache(path, query) {
+        Ok(Some(data)) => Ok(data),
+        Ok(None) => sample_without_cache(path, query),
+        Err(error) if is_sample_locked(&error) => sample_copy(path, query),
+        Err(error) => Err(error),
     }
+}
+
+fn sample_with_cache(path: &Path, query: Query) -> Result<Option<Data>> {
+    let Ok(identity) = collection_identity(path) else {
+        return Ok(None);
+    };
+    let mut guard = cache_lock();
+    let Some(cache) = guard.as_mut() else {
+        return Ok(None);
+    };
+    if cache.path != path || cache.identity != identity {
+        return Ok(None);
+    }
+    let version = data_version(&cache.conn)?;
+    if version != cache.version {
+        return Ok(None);
+    }
+    cache.data.sample(&cache.conn, query).map(Some)
+}
+
+fn sample_without_cache(path: &Path, query: Query) -> Result<Data> {
+    let identity = collection_identity(path)?;
+    let mut guard = cache_lock();
+    let cached = guard.take();
+    let conn = match cached {
+        Some(cache) if cache.path == path && cache.identity == identity => {
+            cache.conn
+        }
+        _ => match open_readonly(path) {
+            Ok(conn) => conn,
+            Err(error) if is_locked(&error) => return sample_copy(path, query),
+            Err(error) => return Err(error.into()),
+        },
+    };
+    let version = data_version(&conn)?;
+    let data = SampleData::from_conn(&conn)?;
+    let sample = match data.sample(&conn, query) {
+        Ok(sample) => sample,
+        Err(error) if is_sample_locked(&error) => {
+            return sample_copy(path, query);
+        }
+        Err(error) => return Err(error),
+    };
+    *guard = Some(Cache {
+        path: path.to_path_buf(),
+        identity,
+        version,
+        conn,
+        data,
+    });
+    Ok(sample)
+}
+
+fn is_sample_locked(error: &Error) -> bool {
+    error
+        .downcast_ref::<rusqlite::Error>()
+        .is_some_and(is_locked)
 }
 
 fn sample_copy(path: &Path, query: Query) -> Result<Data> {
@@ -199,42 +414,15 @@ impl Drop for TemporaryDirectory {
 }
 
 fn sample_connection(conn: &Connection, query: Query) -> Result<Data> {
-    let (days, next_day) = timing(conn, query.now, query.current_west)?;
-    let (reviews, day_learning, intraday_learning, mut new): (
-        i64,
-        i64,
-        i64,
-        i64,
-    ) = conn.query_row(
-        "SELECT
-           coalesce(sum(CASE WHEN queue = 2 AND due <= ? THEN 1 ELSE 0 END), 0),
-           coalesce(sum(CASE WHEN queue = 3 AND due <= ? THEN 1 ELSE 0 END), 0),
-           coalesce(sum(CASE WHEN queue = 1 AND due <= ? THEN 1 ELSE 0 END), 0),
-           coalesce(sum(CASE WHEN queue = 0 THEN 1 ELSE 0 END), 0)
-         FROM cards WHERE queue >= 0",
-        (days, days, query.now),
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-    )?;
-    let completed = conn.query_row(
+    SampleData::from_conn(conn)?.sample(conn, query)
+}
+
+fn completed_count(conn: &Connection, next_day: i64) -> Result<i64> {
+    Ok(conn.query_row(
         "SELECT count(*) FROM revlog WHERE id >= ? AND type BETWEEN 0 AND 3",
         (completed_threshold(next_day),),
         |row| row.get::<_, i64>(0),
-    )?;
-
-    if !query.include_new {
-        new = 0;
-    }
-    let learning = intraday_learning.saturating_add(day_learning);
-    let remaining = reviews.saturating_add(learning).saturating_add(new);
-    Ok(Data {
-        reviews,
-        learning,
-        new,
-        remaining,
-        completed,
-        total: remaining.saturating_add(completed),
-        at: query.now,
-    })
+    )?)
 }
 
 #[cfg(unix)]
@@ -267,64 +455,68 @@ fn current_west(now: i64) -> Option<i64> {
     })
 }
 
+#[cfg(test)]
 fn timing(
     conn: &Connection,
     now: i64,
     current_west: i64,
 ) -> Result<(i64, i64)> {
-    let crt: i64 =
-        conn.query_row("SELECT crt FROM col", [], |row| row.get(0))?;
-    let rollover = match config(conn, "rollover")? {
-        Some(value) if !value.is_empty() => value.parse::<i64>()?,
-        _ => 4,
-    };
+    let config = CollectionConfig::read(conn)?;
+    timing_from(&config, now, current_west)
+}
 
-    if config(conn, "schedVer")?.as_deref() == Some("1") {
-        let days = now.saturating_sub(crt).div_euclid(SECONDS_PER_DAY);
+fn timing_from(
+    config: &CollectionConfig,
+    now: i64,
+    current_west: i64,
+) -> Result<(i64, i64)> {
+    if config.scheduler_one {
+        let days = now.saturating_sub(config.crt).div_euclid(SECONDS_PER_DAY);
         let next_day = days
             .saturating_add(1)
             .saturating_mul(SECONDS_PER_DAY)
-            .saturating_add(crt);
+            .saturating_add(config.crt);
         return Ok((days, next_day));
     }
 
     let mut planned_next_day = None;
-    let days =
-        if let Some(created_west_config) = config(conn, "creationOffset")? {
-            let created_west = created_west_config.parse::<i64>()?;
-            let created = fixed_offset(created_west)?
-                .timestamp_opt(crt, 0)
-                .single()
-                .ok_or("invalid collection creation time")?;
-            let local = fixed_offset(current_west)?
-                .timestamp_opt(now, 0)
-                .single()
-                .ok_or("invalid current time")?;
-            let today_rollover = rollover_stamp(now, current_west, rollover)?;
-            let rollover_passed = today_rollover <= now;
-            let mut days = local
-                .date_naive()
-                .signed_duration_since(created.date_naive())
-                .num_days();
-            if !rollover_passed {
-                days = days.saturating_sub(1);
-            }
-            let candidate = if rollover_passed {
-                today_rollover.saturating_add(SECONDS_PER_DAY)
-            } else {
-                today_rollover
-            };
-            planned_next_day = Some(candidate);
-            days.max(0)
+    let days = if let Some(raw) = config.creation_offset.as_deref() {
+        let created_west = raw.parse::<i64>()?;
+        let created = fixed_offset(created_west)?
+            .timestamp_opt(config.crt, 0)
+            .single()
+            .ok_or("invalid collection creation time")?;
+        let local = fixed_offset(current_west)?
+            .timestamp_opt(now, 0)
+            .single()
+            .ok_or("invalid current time")?;
+        let today_rollover =
+            rollover_stamp(now, current_west, config.rollover)?;
+        let rollover_passed = today_rollover <= now;
+        let mut days = local
+            .date_naive()
+            .signed_duration_since(created.date_naive())
+            .num_days();
+        if !rollover_passed {
+            days = days.saturating_sub(1);
+        }
+        let candidate = if rollover_passed {
+            today_rollover.saturating_add(SECONDS_PER_DAY)
         } else {
-            let crt_rollover = rollover_stamp(crt, current_west, rollover)?;
-            now.saturating_sub(crt_rollover).div_euclid(SECONDS_PER_DAY)
+            today_rollover
         };
+        planned_next_day = Some(candidate);
+        days.max(0)
+    } else {
+        let crt_rollover =
+            rollover_stamp(config.crt, current_west, config.rollover)?;
+        now.saturating_sub(crt_rollover).div_euclid(SECONDS_PER_DAY)
+    };
 
     let next_day = if let Some(value) = planned_next_day {
         value
     } else {
-        let value = rollover_stamp(now, current_west, rollover)?;
+        let value = rollover_stamp(now, current_west, config.rollover)?;
         if value < now {
             value.saturating_add(SECONDS_PER_DAY)
         } else {
@@ -555,5 +747,82 @@ mod tests {
             expand_path("/tmp/collection.anki2", Path::new("/plugin")),
             PathBuf::from("/tmp/collection.anki2")
         );
+    }
+    #[test]
+    fn test_card_index_counts_due_cards() {
+        let conn = database();
+        conn.execute_batch(
+            "INSERT INTO cards (queue, due) VALUES
+               (2, 0), (2, 2), (3, 1), (3, 3), (1, 999), (1, 1001),
+               (0, 0), (-1, 0);",
+        )
+        .expect("cards");
+
+        let index = CardIndex::from_conn(&conn).expect("index");
+
+        assert_eq!(index.counts(1, 1000), (1, 1, 1, 1));
+        assert_eq!(index.counts(4, 2000), (2, 2, 2, 1));
+    }
+
+    #[test]
+    fn test_sample_cache_tracks_collection_changes() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = env::temp_dir()
+            .join(format!("banki-cache-{}-{nanos}", process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("collection.anki2");
+        let now = now_seconds();
+        let writer = Connection::open(&path).expect("collection");
+        writer
+            .execute_batch(
+                "CREATE TABLE col (crt INTEGER);
+                 CREATE TABLE config (key TEXT PRIMARY KEY, val);
+                 CREATE TABLE cards (queue INTEGER, due INTEGER);
+                 CREATE TABLE revlog (id INTEGER, type INTEGER);",
+            )
+            .expect("schema");
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .expect("wal");
+        writer
+            .execute("INSERT INTO col (crt) VALUES (?)", (now - 3600,))
+            .expect("col row");
+        set(&writer, "schedVer", "1");
+        writer
+            .execute("INSERT INTO cards (queue, due) VALUES (0, 0)", [])
+            .expect("card");
+        drop(writer);
+
+        let first = sample(&path, true, now).expect("first sample");
+        assert_eq!(first.new, 1);
+        let cached = sample(&path, true, now).expect("cached sample");
+        assert_eq!(cached.new, 1);
+
+        let writer = Connection::open(&path).expect("collection");
+        writer
+            .execute("INSERT INTO cards (queue, due) VALUES (0, 0)", [])
+            .expect("new card");
+        drop(writer);
+
+        let updated = sample(&path, true, now).expect("updated sample");
+        assert_eq!(updated.new, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn test_scheduler_one_ignores_malformed_creation_offset() {
+        let conn = database();
+        conn.execute("INSERT INTO col (crt) VALUES (1000000)", [])
+            .expect("col row");
+        set(&conn, "schedVer", "1");
+        set(&conn, "creationOffset", "not a number");
+
+        let (days, next) =
+            timing(&conn, 1_000_000 + 2 * 86_400 + 5, 0).expect("timing");
+
+        assert_eq!(days, 2);
+        assert_eq!(next, 1_000_000 + 3 * 86_400);
     }
 }
