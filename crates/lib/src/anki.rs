@@ -115,7 +115,7 @@ pub fn sample(path: &Path, include_new: bool, now: i64) -> Result<Data> {
     let query = Query {
         include_new,
         now,
-        current_west: current_west(now),
+        current_west: current_west(now).ok_or("invalid current time")?,
     };
     match open_readonly(path) {
         Ok(conn) => sample_connection(&conn, query),
@@ -129,13 +129,16 @@ fn sample_copy(path: &Path, query: Query) -> Result<Data> {
     let name = path.file_name().ok_or("collection path has no file name")?;
     let target = directory.0.join(name);
     fs::copy(path, &target)?;
+    make_writable(&target)?;
     let mut wal_source = path.as_os_str().to_os_string();
     wal_source.push("-wal");
     let wal_path = PathBuf::from(wal_source);
     if wal_path.exists() {
-        let mut wal_target = target.as_os_str().to_os_string();
-        wal_target.push("-wal");
-        fs::copy(&wal_path, PathBuf::from(wal_target))?;
+        let mut wal_name = target.as_os_str().to_os_string();
+        wal_name.push("-wal");
+        let wal_target = PathBuf::from(wal_name);
+        fs::copy(&wal_path, &wal_target)?;
+        make_writable(&wal_target)?;
     }
 
     let conn = Connection::open(&target)?;
@@ -215,14 +218,30 @@ fn sample_connection(conn: &Connection, query: Query) -> Result<Data> {
     })
 }
 
+#[cfg(unix)]
+fn make_writable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(permissions.mode() | 0o200);
+    fs::set_permissions(path, permissions)
+}
+
+#[cfg(not(unix))]
+fn make_writable(path: &Path) -> io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(false);
+    fs::set_permissions(path, permissions)
+}
+
 const fn completed_threshold(next_day: i64) -> i64 {
     next_day
         .saturating_sub(SECONDS_PER_DAY)
         .saturating_mul(1000)
 }
 
-fn current_west(now: i64) -> i64 {
-    Local.timestamp_opt(now, 0).single().map_or(0, |local| {
+fn current_west(now: i64) -> Option<i64> {
+    Local.timestamp_opt(now, 0).earliest().map(|local| {
         i64::from(local.offset().local_minus_utc())
             .checked_div(-60)
             .unwrap_or(0)
@@ -467,6 +486,23 @@ mod tests {
 
         assert_eq!(data.new, 0);
         assert_eq!(data.remaining, 0);
+    }
+
+    #[test]
+    fn test_make_writable_clears_read_only() {
+        let dir = env::temp_dir().join(format!("banki-perm-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("collection.anki2");
+        fs::write(&path, b"x").expect("write");
+        let mut permissions = fs::metadata(&path).expect("meta").permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).expect("readonly");
+
+        make_writable(&path).expect("writable");
+
+        assert!(!fs::metadata(&path).expect("meta").permissions().readonly());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

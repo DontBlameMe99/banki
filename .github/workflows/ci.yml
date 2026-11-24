@@ -62,6 +62,17 @@ jobs:
             banki/sync.py \
             banki/LICENSE
 
+      - name: Check the helper is static
+        run: |
+          if readelf -l banki/banki-helper | grep -q INTERP; then
+            echo "banki/banki-helper has a dynamic interpreter" >&2
+            exit 1
+          fi
+          if readelf -d banki/banki-helper | grep -q NEEDED; then
+            echo "banki/banki-helper has dynamic dependencies" >&2
+            exit 1
+          fi
+
       - name: Check the catalog matches the manifest
         run: python3 .github/scripts/check-catalog.py
 

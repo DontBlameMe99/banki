@@ -49,7 +49,8 @@ accent colors are bar-widget settings.
 Collection path selects `collection.anki2` or its profile folder. Leave it empty
 to use the only profile under `~/.local/share/Anki2`. Refresh interval defaults
 to 10 minutes. The icon, number, and whole widget on completion can each be
-hidden. Follow accent colors tints the icon and number from the palette;
+hidden. A hidden widget keeps its update interval, so the next due card makes it
+appear again. Follow accent colors tints the icon and number from the palette;
 turning it off uses Anki blue. The completion check stays green. Include new
 cards is off by default because a raw new-card count ignores deck limits and is
 only an upper bound.

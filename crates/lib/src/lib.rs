@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 
+const ENTRY: &str = "dontblameme/banki:banki";
 const ICON_SOURCE: &str = "assets/anki.svg";
 const ICON_FILL: &str = "#80C2EE";
 const SUCCESS: &str = "#4CAF50";
@@ -90,7 +91,14 @@ pub fn run() -> ExitCode {
 )]
 fn dispatch(ctx: &Context) -> Result<Vec<Op>> {
     match ctx.event.as_str() {
-        "render" | "update" | "right_click" => Ok(refresh(ctx)),
+        "render" | "update" => Ok(refresh(ctx)),
+        "right_click" => Ok(vec![Op::host_call(
+            "noctalia",
+            &["runAsync"],
+            vec![json!([
+                "noctalia", "msg", "plugin", ENTRY, "all", "refresh"
+            ])],
+        )]),
         "ipc" => {
             if ctx.payload_str("event").as_deref() == Some("refresh") {
                 Ok(refresh(ctx))
@@ -147,6 +155,9 @@ fn prepare_key(ctx: &Context) -> Option<PathBuf> {
     }
     let key = ctx.config_str("sync_key").unwrap_or_default();
     let path = ctx.data_dir.join("sync-key");
+    if fs::read_to_string(&path).is_ok_and(|current| current == key.as_ref()) {
+        return Some(path);
+    }
     let _ = fs::write(&path, key.as_bytes());
     Some(path)
 }
@@ -302,19 +313,19 @@ fn tooltip(ctx: &Context, data: &anki::Data, include_new: bool) -> Value {
     json!(rows)
 }
 
-fn interval_ms(ctx: &Context, start: Instant) -> u64 {
+fn refresh_millis(ctx: &Context) -> u64 {
     let seconds = ctx
         .config_str("refresh_seconds")
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(600)
         .max(5);
-    let requested = u64::try_from(seconds).unwrap_or(600);
+    u64::try_from(seconds).unwrap_or(600).saturating_mul(1000)
+}
+
+fn interval_ms(ctx: &Context, start: Instant) -> u64 {
     let elapsed =
         u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-    requested
-        .saturating_mul(1000)
-        .saturating_sub(elapsed)
-        .max(1000)
+    refresh_millis(ctx).saturating_sub(elapsed).max(1000)
 }
 
 fn tint_icon(ctx: &Context, color: &str) -> String {
@@ -442,16 +453,19 @@ fn command_bench(args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use std::process;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
     use super::*;
     use noctalia_rs::Parts;
 
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
     fn context(config: Value, host: Value) -> Context {
-        let dir = env::temp_dir().join(format!(
-            "banki-test-{}-{}",
-            process::id(),
-            anki::now_seconds()
-        ));
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = env::temp_dir()
+            .join(format!("banki-test-{}-{unique}", process::id()));
         let _ = fs::create_dir_all(&dir);
         Context::new(
             Parts {
@@ -498,6 +512,46 @@ mod tests {
         assert!(matches!(ops[1], Op::BarRender { .. }));
         assert!(matches!(ops[2], Op::BarTooltip { .. }));
         assert!(matches!(ops[3], Op::SetInterval { .. }));
+    }
+
+    #[test]
+    fn test_right_click_broadcasts_refresh() {
+        let mut ctx = context(json!({}), json!({}));
+        ctx.event = "right_click".to_owned();
+
+        let ops = dispatch(&ctx).expect("ops");
+
+        let Op::HostCall { root, path, args } = &ops[0] else {
+            panic!("host call");
+        };
+        assert_eq!(root, "noctalia");
+        assert_eq!(path, &["runAsync".to_owned()]);
+        assert_eq!(
+            args,
+            &vec![json!([
+                "noctalia", "msg", "plugin", ENTRY, "all", "refresh"
+            ])]
+        );
+    }
+
+    #[test]
+    fn test_prepare_key_keeps_existing_value() {
+        let ctx = context(
+            json!({ "sync_enabled": true, "sync_key": "secret" }),
+            json!({}),
+        );
+        let path = prepare_key(&ctx).expect("path");
+        let first = fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .expect("mtime");
+        thread::sleep(Duration::from_millis(20));
+
+        let _ = prepare_key(&ctx);
+
+        let second = fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .expect("mtime");
+        assert_eq!(first, second);
     }
 
     #[test]

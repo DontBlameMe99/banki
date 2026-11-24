@@ -34,6 +34,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          components: clippy, rustfmt
           targets: x86_64-unknown-linux-musl
 
       - name: Install musl tools
@@ -61,6 +62,18 @@ jobs:
         run: |
           python3 .github/scripts/emit.py target/x86_64-unknown-linux-musl/release/banki-helper
           mv -f target/x86_64-unknown-linux-musl/release/banki-helper banki/banki-helper
+
+      - name: Check
+        run: |
+          cargo fmt --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
+      - name: Validate plugin manifest
+        uses: noctalia-dev/official-plugins/.github/actions/validate-plugins@5dc1d19b1aa6be331ee6506034dc8448aca5c446 # main
+        with:
+          profile: community
+          root: ${{ github.workspace }}
 
       - name: Check the catalog
         run: python3 .github/scripts/check-catalog.py

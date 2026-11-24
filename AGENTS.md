@@ -4,8 +4,8 @@ Noctalia plugin written in Rust with
 [noctalia-rs](https://github.com/lumi673/noctalia-rs). The workspace follows
 `~/projects/project_templates/rust`: `crates/lib` holds the plugin definition,
 rendering, and Anki logic, and `crates/bin` is the helper CLI.
-`crates/lib/noctalia.toml` is the source of truth for metadata, settings, and
-the widget entry. `banki/` is the generated plugin directory and is committed,
+`crates/lib/noctalia.toml` is the source of truth for metadata, settings, the
+widget entry. `banki/` is the generated plugin directory and is committed,
 including the static helper binary. `crates/lib/sync.py` is the only Python
 code: AnkiWeb sync and sync-key extraction.
 

@@ -14,12 +14,12 @@ subprocess.run(
     cwd=ROOT,
 )
 
-bar = ROOT / "banki/bar.luau"
-text = bar.read_text()
-if "--!nolint FunctionUnused" not in text:
-    lines = text.splitlines()
-    lines.insert(1, "--!nolint FunctionUnused")
-    bar.write_text("\n".join(lines) + "\n")
+for entry in sorted(ROOT.glob("banki/*.luau")):
+    text = entry.read_text()
+    if "--!nolint FunctionUnused" not in text:
+        lines = text.splitlines()
+        lines.insert(1, "--!nolint FunctionUnused")
+        entry.write_text("\n".join(lines) + "\n")
 
 bridge = ROOT / "banki/lib/bridge.luau"
 text = bridge.read_text()
@@ -31,5 +31,9 @@ for line in (
     '  "general.language",\n',
     '  "desktop_widgets.widget",\n',
 ):
+    if line not in text:
+        raise SystemExit(
+            f"emit.py: generated bridge no longer contains {line.strip()}"
+        )
     text = text.replace(line, "")
 bridge.write_text(text)
