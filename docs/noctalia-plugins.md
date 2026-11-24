@@ -18,3 +18,9 @@ the ones worth fetching first.
 
 `noctalia.d.luau` in the official plugins repo is the exact type definition for
 globals such as `noctalia.*`, `ui.*`, and `barWidget.*`.
+
+Banki is written in Rust with
+[noctalia-rs](https://github.com/lumi673/noctalia-rs). `noctalia.toml` generates
+`banki/plugin.toml`, the Luau entry stubs, the bridge, translations, and assets.
+The generated bridge and typed ops are part of that library, so read its
+documentation alongside the Noctalia API pages.

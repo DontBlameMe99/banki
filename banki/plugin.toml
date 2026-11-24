@@ -1,61 +1,68 @@
 id = "dontblameme/banki"
 name = "Banki"
 version = "0.2.4"
-plugin_api = 48
+plugin_api = 56
 author = "DontBlameMe"
-license = "MIT"
-dependencies = []
+license = "GPL-3.0-or-later"
+description = "Anki due-card count with daily totals for the Noctalia bar."
 tags = ["bar", "utility"]
 icon = "sparkles"
-description = "Anki due-card count with daily totals for the Noctalia bar."
+dependencies = []
 
-[[setting]]
+
+  [[setting]]
 key = "sync_enabled"
-type = "bool"
 label_key = "settings.sync_enabled.label"
 description_key = "settings.sync_enabled.description"
+type = "bool"
 default = false
 
-[[setting]]
+
+  [[setting]]
 key = "sync_key"
-type = "string"
 label_key = "settings.sync_key.label"
 description_key = "settings.sync_key.description"
-default = ""
-secret = true
 advanced = true
+secret = true
+type = "string"
+default = ""
 
-[[setting]]
+
+  [[setting]]
 key = "sync_key_file"
-type = "file"
 label_key = "settings.sync_key_file.label"
 description_key = "settings.sync_key_file.description"
-default = ""
 advanced = true
+type = "file"
+default = ""
+extensions = []
 
-[[setting]]
+
+  [[setting]]
 key = "collection_path"
-type = "string"
 label_key = "settings.collection_path.label"
 description_key = "settings.collection_path.description"
+type = "string"
 default = ""
 
-[[setting]]
+
+  [[setting]]
 key = "refresh_seconds"
-type = "int"
 label_key = "settings.refresh_seconds.label"
 description_key = "settings.refresh_seconds.description"
+type = "int"
 default = 600
 min = 5
 max = 1195
 
-[[setting]]
+
+  [[setting]]
 key = "include_new"
-type = "bool"
 label_key = "settings.include_new.label"
 description_key = "settings.include_new.description"
-default = false
 advanced = true
+type = "bool"
+default = false
 
 [[widget]]
 id = "banki"
@@ -63,31 +70,27 @@ entry = "bar.luau"
 [widget.actions]
 left = "exec anki"
 
-
-
-[[widget.setting]]
+  [[widget.setting]]
 key = "hide_icon"
-type = "bool"
 label_key = "settings.hide_icon.label"
+type = "bool"
 default = false
 
-[[widget.setting]]
+  [[widget.setting]]
 key = "hide_text"
-type = "bool"
 label_key = "settings.hide_text.label"
+type = "bool"
 default = false
 
-[[widget.setting]]
+  [[widget.setting]]
 key = "hide_on_complete"
-type = "bool"
 label_key = "settings.hide_on_complete.label"
+type = "bool"
 default = false
 
-[[widget.setting]]
+  [[widget.setting]]
 key = "follow_accent"
-type = "bool"
 label_key = "settings.follow_accent.label"
 description_key = "settings.follow_accent.description"
+type = "bool"
 default = true
-
-

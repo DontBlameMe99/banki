@@ -1,0 +1,90 @@
+name: Bump noctalia-rs
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Released noctalia-rs version, for example 0.2.1
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.BANKI_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
+      - name: Update the dependency
+        env:
+          VERSION: ${{ inputs.version }}
+        run: python3 .github/scripts/bump-noctalia-rs.py "$VERSION"
+
+      - name: Build the helper
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Emit the plugin
+        run: |
+          python3 .github/scripts/emit.py target/x86_64-unknown-linux-musl/release/banki-helper
+          mv -f target/x86_64-unknown-linux-musl/release/banki-helper banki/banki-helper
+          if readelf -l banki/banki-helper | grep -q INTERP; then
+            echo "banki/banki-helper has a dynamic interpreter" >&2
+            exit 1
+          fi
+          if readelf -d banki/banki-helper | grep -q NEEDED; then
+            echo "banki/banki-helper has dynamic dependencies" >&2
+            exit 1
+          fi
+
+      - name: Check
+        run: |
+          cargo fmt --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          python3 .github/scripts/check-catalog.py
+
+      - name: Commit and open a pull request
+        env:
+          GH_TOKEN: ${{ secrets.BANKI_TOKEN || github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          branch="chore/noctalia-rs-$version"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add Cargo.toml Cargo.lock banki
+          if git diff --cached --quiet; then
+            echo "Already on noctalia-rs $version. Nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore(deps): bump noctalia-rs to $version"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:$branch"
+          body="Update the noctalia-rs dependency to $version. This rebuilds the static helper and regenerates banki/. Review the performance section in banki/README.md if idle behavior changed, then merge and run the release workflow."
+          number="$(gh pr list --head "$branch" --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --title "chore(deps): bump noctalia-rs to $version" --body "$body"
+          else
+            gh pr create --base main --head "$branch" --title "chore(deps): bump noctalia-rs to $version" --body "$body"
+          fi
