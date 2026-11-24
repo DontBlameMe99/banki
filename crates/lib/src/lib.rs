@@ -521,6 +521,7 @@ mod tests {
 
         let ops = dispatch(&ctx).expect("ops");
 
+        assert_eq!(ops.len(), 1);
         let Op::HostCall { root, path, args } = &ops[0] else {
             panic!("host call");
         };
@@ -532,6 +533,18 @@ mod tests {
                 "noctalia", "msg", "plugin", ENTRY, "all", "refresh"
             ])]
         );
+    }
+
+    #[test]
+    fn test_entry_matches_manifest() {
+        let plugin = banki_plugin();
+        let entry = plugin
+            .entries
+            .iter()
+            .find(|entry| entry.id.as_ref() == "banki")
+            .expect("widget entry");
+
+        assert_eq!(ENTRY, format!("{}:{}", plugin.meta.id, entry.id).as_str());
     }
 
     #[test]
