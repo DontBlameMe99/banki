@@ -101,11 +101,12 @@ SQLite only when a refresh is due. Noctalia starts it through the noctalia-rs
 bridge, which waits on filesystem events. An idle instance uses about 0.00% of
 one core.
 
-The helper keeps one read-only SQLite connection and indexes card due times in
-memory. It rebuilds the index when the collection changes. An unchanged refresh
-on a 50,000-card fixture takes about 0.01 ms, down from 5.5 ms before the cache.
-The first refresh after startup or after an Anki write still reads the card
-table once. The last good value stays visible if a later check fails.
+The helper opens a read-only connection for a cold refresh, then keeps card due
+times and the completed count in memory. It rebuilds them when the collection
+changes. An unchanged refresh on a 50,000-card fixture takes about 0.003 ms,
+down from 13.6 ms before the cache. The first refresh after startup or after an
+Anki write reads the collection once. The last good value stays visible if a
+later check fails.
 
 Sync runs in a short-lived Python process only when enabled, so Anki's package
 is not kept resident between checks.

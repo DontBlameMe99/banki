@@ -50,6 +50,7 @@ impl CollectionConfig {
     fn read(conn: &Connection) -> Result<Self> {
         let crt =
             conn.query_row("SELECT crt FROM col", [], |row| row.get(0))?;
+        let scheduler_one = config(conn, "schedVer")?.as_deref() == Some("1");
         let rollover = match config(conn, "rollover")? {
             Some(value) if !value.is_empty() => value.parse::<i64>()?,
             _ => 4,
@@ -57,14 +58,18 @@ impl CollectionConfig {
         Ok(Self {
             crt,
             rollover,
-            creation_offset: config(conn, "creationOffset")?,
-            scheduler_one: config(conn, "schedVer")?.as_deref() == Some("1"),
+            creation_offset: if scheduler_one {
+                None
+            } else {
+                config(conn, "creationOffset")?
+            },
+            scheduler_one,
         })
     }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-struct CollectionIdentity {
+struct FileStamp {
     len: u64,
     modified: Option<SystemTime>,
     #[cfg(unix)]
@@ -73,15 +78,43 @@ struct CollectionIdentity {
     inode: u64,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct CollectionIdentity {
+    database: FileStamp,
+    wal: Option<FileStamp>,
+}
+
+fn file_stamp(path: &Path) -> io::Result<Option<FileStamp>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(FileStamp {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn wal_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push("-wal");
+    PathBuf::from(value)
+}
+
 fn collection_identity(path: &Path) -> io::Result<CollectionIdentity> {
-    let metadata = fs::metadata(path)?;
+    let Some(database) = file_stamp(path)? else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "collection not found",
+        ));
+    };
     Ok(CollectionIdentity {
-        len: metadata.len(),
-        modified: metadata.modified().ok(),
-        #[cfg(unix)]
-        device: metadata.dev(),
-        #[cfg(unix)]
-        inode: metadata.ino(),
+        database,
+        wal: file_stamp(&wal_path(path))?,
     })
 }
 
@@ -131,6 +164,26 @@ impl CardIndex {
             _ => {}
         }
     }
+
+    fn data(&self, query: Query, counts: (i64, i64)) -> Data {
+        let (days, completed) = counts;
+        let (reviews, day_learning, intraday_learning, mut new) =
+            self.counts(days, query.now);
+        if !query.include_new {
+            new = 0;
+        }
+        let learning = intraday_learning.saturating_add(day_learning);
+        let remaining = reviews.saturating_add(learning).saturating_add(new);
+        Data {
+            reviews,
+            learning,
+            new,
+            remaining,
+            completed,
+            total: remaining.saturating_add(completed),
+            at: query.now,
+        }
+    }
 }
 
 fn count_at(due: &[i64], limit: i64) -> i64 {
@@ -141,45 +194,42 @@ fn count_at(due: &[i64], limit: i64) -> i64 {
 struct SampleData {
     config: CollectionConfig,
     cards: CardIndex,
+    completed_day: i64,
+    completed: i64,
 }
 
 impl SampleData {
-    fn from_conn(conn: &Connection) -> Result<Self> {
-        Ok(Self {
-            config: CollectionConfig::read(conn)?,
-            cards: CardIndex::from_conn(conn)?,
-        })
+    fn from_conn(conn: &Connection, query: Query) -> Result<(Self, Data)> {
+        let config = CollectionConfig::read(conn)?;
+        let (days, next_day) =
+            timing_from(&config, query.now, query.current_west)?;
+        let cards = CardIndex::from_conn(conn)?;
+        let completed = completed_count(conn, next_day)?;
+        let data = cards.data(query, (days, completed));
+        Ok((
+            Self {
+                config,
+                cards,
+                completed_day: next_day,
+                completed,
+            },
+            data,
+        ))
     }
 
-    fn sample(&self, conn: &Connection, query: Query) -> Result<Data> {
+    fn sample(&self, query: Query) -> Result<Option<Data>> {
         let (days, next_day) =
             timing_from(&self.config, query.now, query.current_west)?;
-        let (reviews, day_learning, intraday_learning, mut new) =
-            self.cards.counts(days, query.now);
-        let completed = completed_count(conn, next_day)?;
-
-        if !query.include_new {
-            new = 0;
+        if next_day != self.completed_day {
+            return Ok(None);
         }
-        let learning = intraday_learning.saturating_add(day_learning);
-        let remaining = reviews.saturating_add(learning).saturating_add(new);
-        Ok(Data {
-            reviews,
-            learning,
-            new,
-            remaining,
-            completed,
-            total: remaining.saturating_add(completed),
-            at: query.now,
-        })
+        Ok(Some(self.cards.data(query, (days, self.completed))))
     }
 }
 
 struct Cache {
     path: PathBuf,
     identity: CollectionIdentity,
-    version: i64,
-    conn: Connection,
     data: SampleData,
 }
 
@@ -189,9 +239,6 @@ fn cache_lock() -> MutexGuard<'static, Option<Cache>> {
     CACHE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn data_version(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row("PRAGMA data_version", [], |row| row.get(0))?)
-}
 pub fn now_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -282,7 +329,6 @@ pub fn sample(path: &Path, include_new: bool, now: i64) -> Result<Data> {
     match sample_with_cache(path, query) {
         Ok(Some(data)) => Ok(data),
         Ok(None) => sample_without_cache(path, query),
-        Err(error) if is_sample_locked(&error) => sample_copy(path, query),
         Err(error) => Err(error),
     }
 }
@@ -291,48 +337,37 @@ fn sample_with_cache(path: &Path, query: Query) -> Result<Option<Data>> {
     let Ok(identity) = collection_identity(path) else {
         return Ok(None);
     };
-    let mut guard = cache_lock();
-    let Some(cache) = guard.as_mut() else {
+    let guard = cache_lock();
+    let Some(cache) = guard.as_ref() else {
         return Ok(None);
     };
     if cache.path != path || cache.identity != identity {
         return Ok(None);
     }
-    let version = data_version(&cache.conn)?;
-    if version != cache.version {
-        return Ok(None);
-    }
-    cache.data.sample(&cache.conn, query).map(Some)
+    cache.data.sample(query)
 }
 
 fn sample_without_cache(path: &Path, query: Query) -> Result<Data> {
     let identity = collection_identity(path)?;
     let mut guard = cache_lock();
-    let cached = guard.take();
-    let conn = match cached {
-        Some(cache) if cache.path == path && cache.identity == identity => {
-            cache.conn
-        }
-        _ => match open_readonly(path) {
-            Ok(conn) => conn,
-            Err(error) if is_locked(&error) => return sample_copy(path, query),
-            Err(error) => return Err(error.into()),
-        },
+    let _ = guard.take();
+    let conn = match open_readonly(path) {
+        Ok(conn) => conn,
+        Err(error) if is_locked(&error) => return sample_copy(path, query),
+        Err(error) => return Err(error.into()),
     };
-    let version = data_version(&conn)?;
-    let data = SampleData::from_conn(&conn)?;
-    let sample = match data.sample(&conn, query) {
-        Ok(sample) => sample,
+    let (data, sample) = match SampleData::from_conn(&conn, query) {
+        Ok(result) => result,
         Err(error) if is_sample_locked(&error) => {
+            drop(conn);
             return sample_copy(path, query);
         }
         Err(error) => return Err(error),
     };
+    drop(conn);
     *guard = Some(Cache {
         path: path.to_path_buf(),
         identity,
-        version,
-        conn,
         data,
     });
     Ok(sample)
@@ -414,7 +449,8 @@ impl Drop for TemporaryDirectory {
 }
 
 fn sample_connection(conn: &Connection, query: Query) -> Result<Data> {
-    SampleData::from_conn(conn)?.sample(conn, query)
+    let (_, data) = SampleData::from_conn(conn, query)?;
+    Ok(data)
 }
 
 fn completed_count(conn: &Connection, next_day: i64) -> Result<i64> {
@@ -824,5 +860,22 @@ mod tests {
 
         assert_eq!(days, 2);
         assert_eq!(next, 1_000_000 + 3 * 86_400);
+    }
+    #[test]
+    fn test_scheduler_one_skips_invalid_creation_offset_text() {
+        let conn = database();
+        let now = 1_000_000;
+        conn.execute("INSERT INTO col (crt) VALUES (?)", (now - 3600,))
+            .expect("col row");
+        set(&conn, "schedVer", "1");
+        conn.execute(
+            "INSERT INTO config (key, val) VALUES ('creationOffset', CAST(x'FF' AS TEXT))",
+            [],
+        )
+        .expect("invalid config text");
+
+        let data = sample_connection(&conn, query(false, now)).expect("sample");
+
+        assert_eq!(data.at, now);
     }
 }

@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Create an Anki-shaped collection for `banki-helper bench`."""
+"""Create an Anki-shaped collection for `banki-helper bench`.
 
+Revlog IDs start at 00:00 UTC+2, the day boundary used by the fixture config.
+"""
+
+import os
+from datetime import datetime, timedelta, timezone
 import argparse
 import random
 import sqlite3
@@ -33,7 +38,11 @@ def build(path: Path, cards: int, reviews: int, seed: int) -> None:
     rng = random.Random(seed)
     path.parent.mkdir(parents=True, exist_ok=True)
     for suffix in ("", "-wal", "-shm"):
-        Path(str(path) + suffix).unlink(missing_ok=True)
+        target = Path(str(path) + suffix)
+        if target.exists():
+            raise SystemExit(f"refusing to overwrite {target}")
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(fd)
 
     conn = sqlite3.connect(path)
     conn.executescript(SCHEMA)
@@ -71,7 +80,10 @@ def build(path: Path, cards: int, reviews: int, seed: int) -> None:
             for card, queue in enumerate(queues, start=1)
         ],
     )
-    base = (now - 86_400) * 1000
+    zone = timezone(timedelta(hours=2))
+    local = datetime.now(zone)
+    midnight = datetime(local.year, local.month, local.day, tzinfo=zone)
+    base = int(midnight.timestamp()) * 1000
     conn.executemany(
         "INSERT INTO revlog VALUES (?, ?, 0, 3, 10, 5, 2500, 1000, ?)",
         [
@@ -91,6 +103,10 @@ def main() -> None:
     parser.add_argument("--reviews", type=int, default=500_000)
     parser.add_argument("--seed", type=int, default=11)
     args = parser.parse_args()
+    if args.cards < 0 or args.reviews < 0:
+        parser.error("counts must not be negative")
+    if args.reviews and not args.cards:
+        parser.error("reviews require at least one card")
     build(args.path, args.cards, args.reviews, args.seed)
 
 

@@ -416,6 +416,10 @@ fn command_bench(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let iterations = iterations_arg.parse::<usize>().unwrap_or(1000);
+    if iterations == 0 {
+        eprintln!("iterations must be at least 1");
+        return ExitCode::FAILURE;
+    }
     let include_new = args.get(3).is_some_and(|value| value == "1");
     let path = match anki::collection_path(collection, Path::new(".")) {
         Ok(path) => path,
@@ -441,6 +445,10 @@ fn command_bench(args: &[String]) -> ExitCode {
         }
     }
     samples.sort_by(f64::total_cmp);
+    if samples.is_empty() {
+        println!("n=0 first={first:.1}us median=n/a p95=n/a min=n/a max=n/a");
+        return ExitCode::SUCCESS;
+    }
     let at = |percent: usize| {
         let rank = samples
             .len()
