@@ -7,10 +7,9 @@ shows the number learnable right now. Anki does not need to run, and the widget
 also works while Anki is open. AnkiWeb sync is optional.
 
 The widget is written in Rust with
-[noctalia-rs](https://github.com/lumi673/noctalia-rs). The workspace follows the
-usual `crates/lib` plus `crates/bin` split. `crates/lib/noctalia.toml` is the
-source of truth. `banki/` holds the generated plugin and the static helper
-binary.
+[noctalia-rs](https://github.com/lumi673/noctalia-rs). The crate at the
+repository root builds the helper binary. `noctalia.toml` is the source of
+truth. `banki/` holds the generated plugin and the static helper binary.
 
 ## Install
 
