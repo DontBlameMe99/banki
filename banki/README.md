@@ -17,9 +17,10 @@ while Anki is open. By default, no AnkiWeb account is used.
 
 ## Requirements
 
-Counting needs no runtime beyond the bundled static helper. Anki is only
-needed to create the collection. Optional sync uses Python 3, Anki's Python
-package, and AnkiWeb.
+Counting needs no runtime beyond the bundled static helper. The helper is a
+static x86-64 Linux binary. Other architectures need a native build. Anki is
+only needed to create the collection. Optional sync uses Python 3, Anki's
+Python package, and AnkiWeb.
 
 ## Usage
 
@@ -29,9 +30,10 @@ Anki's day number, and intraday learning cards use a Unix timestamp. Suspended
 and buried cards are ignored. Cards due later are ignored even when Anki's own
 learn-ahead window would show them.
 
-The widget counts all decks, not only the deck currently open in Anki. Day
-boundaries follow Anki's scheduler settings in the collection, including
-rollover hour, creation offset, and daylight saving changes. The helper opens
+The widget counts all decks, not only the deck currently open in Anki. With the
+v2 scheduler, day boundaries follow the collection's rollover hour, creation
+offset, and daylight saving changes. The v1 scheduler uses fixed 24-hour
+periods from the collection creation time. The helper opens
 the database read-only and never writes to it. While Anki holds its exclusive
 lock, the helper reads a temporary copy of the collection and its write-ahead
 log, so refreshes keep working and include reviews from the open session.
@@ -78,8 +80,9 @@ python3 sync.py key main
 ```
 
 The first form uses the last loaded profile. The second selects a profile by
-name. The command prints only the key, so it can be redirected into a
-sops-managed file.
+name. The key file and `/run/secrets/anki/sync-key` take precedence, so the
+profile name is used only when neither supplies a key. The command prints only
+the key, so it can be redirected into a sops-managed file.
 
 On NixOS with the Anki home module, the key is usually already at
 `/run/secrets/anki/sync-key`. The `key` command checks that file first, then the

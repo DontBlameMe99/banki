@@ -28,8 +28,8 @@ CI runs these:
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 python3 .github/scripts/check-catalog.py
 python3 /path/to/validate-plugins.py --profile community --root .
 luau-lsp analyze --definitions=/path/to/noctalia.d.luau --ignore 'banki/lib/bridge.luau' banki

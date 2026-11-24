@@ -5,7 +5,9 @@ local bridge = require("./lib/bridge.luau")
 bridge.setup("banki", { "sync_enabled", "sync_key", "sync_key_file", "collection_path", "refresh_seconds", "include_new", "hide_icon", "hide_text", "hide_on_complete", "follow_accent" })
 
 function onClick() bridge.call("click") end
-function onRightClick() bridge.call("right_click") end
+function onRightClick()
+  noctalia.runAsync({ "noctalia", "msg", "plugin", "dontblameme/banki:banki", "all", "refresh" })
+end
 function onMiddleClick() bridge.call("middle_click") end
 function onDoubleClick() bridge.call("double_click") end
 function onScroll(axis, steps, startsGesture) bridge.call("scroll", { axis = axis, steps = steps, starts_gesture = startsGesture }) end
@@ -35,4 +37,11 @@ function onSearch(text) bridge.call("search", { text = text }) end
 function onSearchChange(text) bridge.call("search_change", { text = text }) end
 function update() bridge.call("render", { source = "update" }) end
 bridge.watch_state(function() bridge.call("render", { source = "state" }) end)
+local waiting = barWidget.isVertical() and ui.column or ui.row
+barWidget.setVisible(true)
+barWidget.render(waiting({ gap = 6, align = "center", justify = "center" }, {
+  ui.image({ path = "assets/anki.svg", width = 16, height = 16, fit = "contain" }),
+  ui.label({ text = "..." }),
+}))
+barWidget.setTooltip(noctalia.tr("tooltip.waiting"))
 bridge.call("render", { source = "load" })

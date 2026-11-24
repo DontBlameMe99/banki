@@ -76,10 +76,15 @@ pub fn expand_path(raw: &str, plugin_dir: &Path) -> PathBuf {
     if path.is_empty() {
         return PathBuf::new();
     }
-    if (path == "~" || path.starts_with("~/"))
+    if path == "~"
         && let Some(home) = env::var_os("HOME")
     {
-        return PathBuf::from(home).join(path.trim_start_matches("~/"));
+        return PathBuf::from(home);
+    }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
     let value = Path::new(path);
     if value.is_absolute() {
@@ -165,6 +170,20 @@ impl TemporaryDirectory {
     }
 }
 
+#[cfg(unix)]
+fn create_directory(path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
 fn create_directory(path: &Path) -> io::Result<bool> {
     match fs::create_dir(path) {
         Ok(()) => Ok(true),
@@ -503,6 +522,31 @@ mod tests {
 
         assert!(!fs::metadata(&path).expect("meta").permissions().readonly());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_expand_path_home() {
+        let Some(home) = env::var_os("HOME") else {
+            return;
+        };
+        let home_path = PathBuf::from(home);
+        assert_eq!(expand_path("~", Path::new("/plugin")), home_path);
+        assert_eq!(
+            expand_path("~/collection.anki2", Path::new("/plugin")),
+            home_path.join("collection.anki2")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_temporary_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TemporaryDirectory::new().expect("temp dir");
+        let mode =
+            fs::metadata(&dir.0).expect("meta").permissions().mode() & 0o777;
+
+        assert_eq!(mode, 0o700);
     }
 
     #[test]

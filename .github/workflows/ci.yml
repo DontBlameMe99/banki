@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Validate plugin manifest
         uses: noctalia-dev/official-plugins/.github/actions/validate-plugins@5dc1d19b1aa6be331ee6506034dc8448aca5c446 # main
@@ -34,11 +36,17 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
 
       - name: Check formatting
         run: cargo fmt --check
@@ -50,9 +58,15 @@ jobs:
         run: cargo test --workspace
 
       - name: Check generated plugin matches
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
-          cargo build
-          python3 .github/scripts/emit.py target/debug/banki-helper
+          cargo build --release --target x86_64-unknown-linux-musl
+          python3 .github/scripts/emit.py target/x86_64-unknown-linux-musl/release/banki-helper
+          # The committed helper is rebuilt by the release and bump workflows.
+          # CI cannot compare it byte-for-byte because local and runner
+          # toolchains produce different binaries.
           git diff --exit-code -- \
             banki/plugin.toml \
             banki/bar.luau \
@@ -64,12 +78,13 @@ jobs:
 
       - name: Check the helper is static
         run: |
-          if readelf -l banki/banki-helper | grep -q INTERP; then
-            echo "banki/banki-helper has a dynamic interpreter" >&2
+          helper=target/x86_64-unknown-linux-musl/release/banki-helper
+          if readelf -l "$helper" | grep -q INTERP; then
+            echo "$helper has a dynamic interpreter" >&2
             exit 1
           fi
-          if readelf -d banki/banki-helper | grep -q NEEDED; then
-            echo "banki/banki-helper has dynamic dependencies" >&2
+          if readelf -d "$helper" | grep -q NEEDED; then
+            echo "$helper has dynamic dependencies" >&2
             exit 1
           fi
 

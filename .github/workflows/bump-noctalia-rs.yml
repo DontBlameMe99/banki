@@ -21,6 +21,7 @@ jobs:
           ref: main
           fetch-depth: 0
           token: ${{ secrets.BANKI_TOKEN || github.token }}
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -46,6 +47,14 @@ jobs:
         run: |
           python3 .github/scripts/emit.py target/x86_64-unknown-linux-musl/release/banki-helper
           mv -f target/x86_64-unknown-linux-musl/release/banki-helper banki/banki-helper
+          if readelf -l banki/banki-helper | grep -q INTERP; then
+            echo "banki/banki-helper has a dynamic interpreter" >&2
+            exit 1
+          fi
+          if readelf -d banki/banki-helper | grep -q NEEDED; then
+            echo "banki/banki-helper has dynamic dependencies" >&2
+            exit 1
+          fi
 
       - name: Check
         run: |
@@ -71,7 +80,7 @@ jobs:
             exit 0
           fi
           git commit -m "chore(deps): bump noctalia-rs to $version"
-          git push --force origin "HEAD:$branch"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:$branch"
           body="Update the noctalia-rs dependency to $version. This rebuilds the static helper and regenerates banki/. Review the performance section in banki/README.md if idle behavior changed, then merge and run the release workflow."
           number="$(gh pr list --head "$branch" --json number --jq '.[0].number // empty')"
           if [ -n "$number" ]; then

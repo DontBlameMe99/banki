@@ -13,7 +13,6 @@ use serde_json::{Value, json};
 
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 
-const ENTRY: &str = "dontblameme/banki:banki";
 const ICON_SOURCE: &str = "assets/anki.svg";
 const ICON_FILL: &str = "#80C2EE";
 const SUCCESS: &str = "#4CAF50";
@@ -92,13 +91,6 @@ pub fn run() -> ExitCode {
 fn dispatch(ctx: &Context) -> Result<Vec<Op>> {
     match ctx.event.as_str() {
         "render" | "update" => Ok(refresh(ctx)),
-        "right_click" => Ok(vec![Op::host_call(
-            "noctalia",
-            &["runAsync"],
-            vec![json!([
-                "noctalia", "msg", "plugin", ENTRY, "all", "refresh"
-            ])],
-        )]),
         "ipc" => {
             if ctx.payload_str("event").as_deref() == Some("refresh") {
                 Ok(refresh(ctx))
@@ -122,10 +114,7 @@ fn refresh(ctx: &Context) -> Vec<Op> {
         return render_ops(ctx, cached().as_ref(), start);
     };
 
-    if ctx.config_bool("sync_enabled", false)
-        && let Some(key) = prepare_key(ctx)
-        && !run_sync(ctx, &collection, &key)
-    {
+    if !prepare_and_sync(ctx, &collection) {
         return render_ops(ctx, cached().as_ref(), start);
     }
 
@@ -143,23 +132,34 @@ fn refresh(ctx: &Context) -> Vec<Op> {
     )
 }
 
-fn prepare_key(ctx: &Context) -> Option<PathBuf> {
+fn prepare_and_sync(ctx: &Context, collection: &Path) -> bool {
     if !ctx.config_bool("sync_enabled", false) {
-        return None;
+        return true;
+    }
+    match prepare_key(ctx) {
+        Ok(Some(key)) => run_sync(ctx, collection, &key),
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
+fn prepare_key(ctx: &Context) -> Result<Option<PathBuf>> {
+    if !ctx.config_bool("sync_enabled", false) {
+        return Ok(None);
     }
     if let Some(key_file) = ctx.config_str("sync_key_file") {
         let trimmed = key_file.trim();
         if !trimmed.is_empty() {
-            return Some(anki::expand_path(trimmed, &plugin_dir(ctx)));
+            return Ok(Some(anki::expand_path(trimmed, &plugin_dir(ctx))));
         }
     }
     let key = ctx.config_str("sync_key").unwrap_or_default();
     let path = ctx.data_dir.join("sync-key");
     if fs::read_to_string(&path).is_ok_and(|current| current == key.as_ref()) {
-        return Some(path);
+        return Ok(Some(path));
     }
-    let _ = fs::write(&path, key.as_bytes());
-    Some(path)
+    fs::write(&path, key.as_bytes())?;
+    Ok(Some(path))
 }
 
 fn run_sync(ctx: &Context, collection: &Path, key: &Path) -> bool {
@@ -363,10 +363,15 @@ fn command_sample(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let include_new = include_arg == "1";
-    let now = args
-        .get(3)
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or_else(anki::now_seconds);
+    let now = if let Some(value) = args.get(3) {
+        let Ok(now) = value.parse::<i64>() else {
+            eprintln!("invalid timestamp: {value}");
+            return ExitCode::FAILURE;
+        };
+        now
+    } else {
+        anki::now_seconds()
+    };
     let path = match anki::collection_path(collection, Path::new(".")) {
         Ok(path) => path,
         Err(error) => {
@@ -431,12 +436,12 @@ fn command_bench(args: &[String]) -> ExitCode {
     }
     samples.sort_by(f64::total_cmp);
     let at = |percent: usize| {
-        let index = samples
+        let rank = samples
             .len()
             .saturating_mul(percent)
-            .saturating_div(100)
-            .saturating_sub(1)
-            .min(samples.len().saturating_sub(1));
+            .saturating_add(99)
+            .saturating_div(100);
+        let index = rank.saturating_sub(1).min(samples.len().saturating_sub(1));
         samples.get(index).copied().unwrap_or(0.0)
     };
     println!(
@@ -515,45 +520,12 @@ mod tests {
     }
 
     #[test]
-    fn test_right_click_broadcasts_refresh() {
-        let mut ctx = context(json!({}), json!({}));
-        ctx.event = "right_click".to_owned();
-
-        let ops = dispatch(&ctx).expect("ops");
-
-        assert_eq!(ops.len(), 1);
-        let Op::HostCall { root, path, args } = &ops[0] else {
-            panic!("host call");
-        };
-        assert_eq!(root, "noctalia");
-        assert_eq!(path, &["runAsync".to_owned()]);
-        assert_eq!(
-            args,
-            &vec![json!([
-                "noctalia", "msg", "plugin", ENTRY, "all", "refresh"
-            ])]
-        );
-    }
-
-    #[test]
-    fn test_entry_matches_manifest() {
-        let plugin = banki_plugin();
-        let entry = plugin
-            .entries
-            .iter()
-            .find(|entry| entry.id.as_ref() == "banki")
-            .expect("widget entry");
-
-        assert_eq!(ENTRY, format!("{}:{}", plugin.meta.id, entry.id).as_str());
-    }
-
-    #[test]
     fn test_prepare_key_keeps_existing_value() {
         let ctx = context(
             json!({ "sync_enabled": true, "sync_key": "secret" }),
             json!({}),
         );
-        let path = prepare_key(&ctx).expect("path");
+        let path = prepare_key(&ctx).expect("prepare").expect("key path");
         let first = fs::metadata(&path)
             .and_then(|meta| meta.modified())
             .expect("mtime");
