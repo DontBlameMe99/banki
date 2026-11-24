@@ -162,11 +162,11 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE col (crt INTEGER);
              CREATE TABLE config (key TEXT PRIMARY KEY, val);
-             CREATE TABLE cards (queue INTEGER, due INTEGER);
+             CREATE TABLE cards (id INTEGER PRIMARY KEY, queue INTEGER, due INTEGER);
              CREATE TABLE revlog (id INTEGER, type INTEGER);
              INSERT INTO col (crt) VALUES (0);
              INSERT INTO config (key, val) VALUES ('schedVer', '1');
-             INSERT INTO cards (queue, due) VALUES (2, 0), (2, 0), (2, 0);",
+             INSERT INTO cards (id, queue, due) VALUES (1, 2, 0), (2, 2, 0), (3, 2, 0);",
         )
         .expect("schema");
         path

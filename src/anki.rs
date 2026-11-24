@@ -2,17 +2,20 @@ use std::env;
 use std::error::Error as StdError;
 use std::fs;
 use std::io;
+use std::num::NonZero;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::result::Result as StdResult;
 use std::sync::Mutex;
+use std::sync::mpsc::{self, Sender};
+use std::thread::{self, ScopedJoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{FixedOffset, Local, TimeZone};
 use rusqlite::ffi::ErrorCode;
-use rusqlite::types::Value;
+use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::lock;
@@ -22,6 +25,7 @@ pub type Result<T> = StdResult<T, Error>;
 
 const SECONDS_PER_DAY: i64 = 86_400;
 const DEFAULT_ROLLOVER_HOUR: i64 = 4;
+const MMAP_SIZE: i64 = 1_073_741_824;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Data {
@@ -102,6 +106,17 @@ fn file_stamp(path: &Path) -> io::Result<Option<FileStamp>> {
     }
 }
 
+impl FileStamp {
+    const fn same_file(self, other: Self) -> bool {
+        #[cfg(unix)]
+        let same_inode =
+            self.device == other.device && self.inode == other.inode;
+        #[cfg(not(unix))]
+        let same_inode = true;
+        self.len == other.len && same_inode
+    }
+}
+
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
@@ -130,24 +145,68 @@ struct CardIndex {
     new: i64,
 }
 
+fn due_values(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, i64)> {
+    match (row.get_ref(0)?, row.get_ref(1)?) {
+        (ValueRef::Integer(queue), ValueRef::Integer(due)) => Ok((queue, due)),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
 impl CardIndex {
-    fn from_conn(conn: &Connection) -> Result<Self> {
-        let mut index = Self::default();
+    fn from_conn(conn: &Connection) -> rusqlite::Result<Self> {
         let mut stmt =
             conn.prepare("SELECT queue, due FROM cards WHERE queue >= 0")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
         })?;
-        for row in rows {
-            let (queue, due) = row?;
-            index.add(queue, due);
-        }
-        index.reviews.sort_unstable();
-        index.day_learning.sort_unstable();
-        index.intraday_learning.sort_unstable();
+        let mut index = Self::default();
+        index.collect(rows)?;
+        index.sort();
         Ok(index)
     }
 
+    fn from_range(
+        conn: &Connection,
+        low: i64,
+        high: i64,
+    ) -> rusqlite::Result<Self> {
+        let mut stmt = conn.prepare(
+            "SELECT queue, due FROM cards WHERE id BETWEEN ? AND ? AND queue >= 0",
+        )?;
+        stmt.raw_bind_parameter(1, low)?;
+        stmt.raw_bind_parameter(2, high)?;
+        let mut rows = stmt.raw_query();
+        let mut index = Self::default();
+        while let Some(row) = rows.next()? {
+            let (queue, due) = due_values(row)?;
+            index.add(queue, due);
+        }
+        Ok(index)
+    }
+
+    fn collect(
+        &mut self,
+        rows: impl Iterator<Item = rusqlite::Result<(i64, i64)>>,
+    ) -> rusqlite::Result<()> {
+        for row in rows {
+            let (queue, due) = row?;
+            self.add(queue, due);
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.reviews.extend(other.reviews);
+        self.day_learning.extend(other.day_learning);
+        self.intraday_learning.extend(other.intraday_learning);
+        self.new = self.new.saturating_add(other.new);
+    }
+
+    fn sort(&mut self) {
+        self.reviews.sort_unstable();
+        self.day_learning.sort_unstable();
+        self.intraday_learning.sort_unstable();
+    }
     fn add(&mut self, queue: i64, due: i64) {
         match queue {
             0 => self.new = self.new.saturating_add(1),
@@ -191,6 +250,162 @@ fn count_at(due: &[i64], limit: i64) -> i64 {
         .unwrap_or(i64::MAX)
 }
 
+fn read_chunks() -> usize {
+    thread::available_parallelism()
+        .map_or(4, NonZero::get)
+        .min(7)
+}
+
+fn chunk_bounds(low: i64, high: i64) -> Vec<(i64, i64)> {
+    let chunks = read_chunks();
+    let span = high.saturating_sub(low);
+    let count = i64::try_from(chunks).unwrap_or(1);
+    let step = span.checked_div(count).unwrap_or(0).saturating_add(1);
+    (0..chunks)
+        .filter_map(|index| {
+            let offset = i64::try_from(index).ok()?;
+            let start = low.saturating_add(step.saturating_mul(offset));
+            let end = if index.saturating_add(1) == chunks {
+                high
+            } else {
+                low.saturating_add(
+                    step.saturating_mul(offset.saturating_add(1)),
+                )
+                .saturating_sub(1)
+            };
+            (start <= end).then_some((start, end))
+        })
+        .collect()
+}
+
+fn join_chunk<T>(
+    handle: ScopedJoinHandle<'_, rusqlite::Result<T>>,
+) -> rusqlite::Result<T> {
+    handle.join().map_err(|_| rusqlite::Error::InvalidQuery)?
+}
+
+type ChunkMessage<T> = (rusqlite::Result<T>, Connection);
+type ChunkQuery<T> = fn(&Connection, i64, i64) -> rusqlite::Result<T>;
+type ChunkOutput<T> = (Vec<T>, Vec<Connection>);
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the chunk worker carries a reused connection"
+)]
+fn run_chunk<T>(
+    path: &Path,
+    bounds: (i64, i64),
+    available: Option<Connection>,
+    sender: &Sender<ChunkMessage<T>>,
+    query: ChunkQuery<T>,
+) -> rusqlite::Result<()> {
+    let worker = match available {
+        Some(worker) => worker,
+        None => open_worker(path)?,
+    };
+    let value = query(&worker, bounds.0, bounds.1);
+    let _ = sender.send((value, worker));
+    Ok(())
+}
+
+#[expect(
+    clippy::excessive_nesting,
+    reason = "the scoped worker loop is clearer inline"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the chunk runner is shared by both read phases"
+)]
+fn run_chunks<T: Send + 'static>(
+    path: &Path,
+    bounds: &[(i64, i64)],
+    available: Vec<Connection>,
+    query: ChunkQuery<T>,
+) -> rusqlite::Result<ChunkOutput<T>> {
+    let (sender, receiver) = mpsc::channel();
+    let (values, workers) = thread::scope(|scope| {
+        let mut handles = Vec::new();
+        let mut available = available;
+        for &(low, high) in bounds.iter().skip(1) {
+            let chunk_sender = sender.clone();
+            let chunk_worker = available.pop();
+            handles.push(scope.spawn(move || {
+                run_chunk(path, (low, high), chunk_worker, &chunk_sender, query)
+            }));
+        }
+        if let Some(&(low, high)) = bounds.first() {
+            let worker =
+                available.pop().map_or_else(|| open_worker(path), Ok)?;
+            let value = query(&worker, low, high);
+            let _ = sender.send((value, worker));
+        }
+        drop(sender);
+        for handle in handles {
+            join_chunk(handle)?;
+        }
+
+        let mut values = Vec::with_capacity(bounds.len());
+        let mut workers = Vec::with_capacity(bounds.len());
+        for _ in 0..bounds.len() {
+            let (value, worker) =
+                receiver.recv().map_err(|_| rusqlite::Error::InvalidQuery)?;
+            values.push(value?);
+            workers.push(worker);
+        }
+        Ok::<ChunkOutput<T>, rusqlite::Error>((values, workers))
+    })?;
+    Ok((values, workers))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    reason = "the parallel reader returns its reusable connections"
+)]
+fn read_in_parallel(
+    conn: Connection,
+    path: &Path,
+    next_day: i64,
+    available: Vec<Connection>,
+) -> rusqlite::Result<(CardIndex, i64, Vec<Connection>)> {
+    let threshold = completed_threshold(next_day);
+    let last_review: Option<i64> =
+        conn.query_row("SELECT max(id) FROM revlog", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?;
+    let first_card: Option<i64> =
+        conn.query_row("SELECT min(id) FROM cards", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?;
+    let last_card: Option<i64> =
+        conn.query_row("SELECT max(id) FROM cards", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?;
+
+    let card_bounds = match (first_card, last_card) {
+        (Some(first), Some(last)) => chunk_bounds(first, last),
+        _ => Vec::new(),
+    };
+    let mut available = available;
+    available.push(conn);
+    let (parts, workers) =
+        run_chunks(path, &card_bounds, available, CardIndex::from_range)?;
+    let mut cards = CardIndex::default();
+    for part in parts {
+        cards.merge(part);
+    }
+    cards.sort();
+
+    let review_bounds = match last_review {
+        Some(last) if last >= threshold => chunk_bounds(threshold, last),
+        _ => Vec::new(),
+    };
+    let (counts, reused) =
+        run_chunks(path, &review_bounds, workers, completed_count_range)?;
+    let completed = counts.into_iter().fold(0_i64, i64::saturating_add);
+    Ok((cards, completed, reused))
+}
+
 struct SampleData {
     config: CollectionConfig,
     cards: CardIndex,
@@ -199,12 +414,22 @@ struct SampleData {
 }
 
 impl SampleData {
-    fn from_conn(conn: &Connection, query: Query) -> Result<(Self, Data)> {
-        let config = CollectionConfig::read(conn)?;
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::type_complexity,
+        reason = "the sample returns its reusable connections"
+    )]
+    fn from_conn(
+        conn: Connection,
+        path: &Path,
+        query: Query,
+        workers: Vec<Connection>,
+    ) -> Result<(Self, Data, Vec<Connection>)> {
+        let config = CollectionConfig::read(&conn)?;
         let (days, next_day) =
             timing_from(&config, query.now, query.current_west)?;
-        let cards = CardIndex::from_conn(conn)?;
-        let completed = completed_count(conn, next_day)?;
+        let (cards, completed, reused) =
+            read_in_parallel(conn, path, next_day, workers)?;
         let data = cards.data(query, (days, completed));
         Ok((
             Self {
@@ -214,6 +439,7 @@ impl SampleData {
                 completed,
             },
             data,
+            reused,
         ))
     }
 
@@ -231,6 +457,8 @@ struct Cache {
     path: PathBuf,
     identity: CollectionIdentity,
     data: SampleData,
+    workers: Vec<Connection>,
+    workers_stamp: Option<FileStamp>,
 }
 
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
@@ -293,6 +521,22 @@ fn home_relative(path: &str) -> Option<PathBuf> {
     path.strip_prefix("~/").map(|rest| home.join(rest))
 }
 
+fn open_worker(path: &Path) -> rusqlite::Result<Connection> {
+    let flags =
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)?;
+    let _ = conn.pragma_update(None, "mmap_size", MMAP_SIZE);
+    Ok(conn)
+}
+
+fn open_readonly(path: &Path) -> rusqlite::Result<Connection> {
+    let conn = open_worker(path)?;
+    conn.busy_timeout(Duration::from_secs(1))?;
+    // Reading the row also rejects a file that is not an Anki collection.
+    conn.query_row("select 1 from col limit 1", [], |_| Ok(()))?;
+    Ok(conn)
+}
+
 pub fn sample(path: &Path, include_new: bool, now: i64) -> Result<Data> {
     let query = Query {
         include_new,
@@ -319,47 +563,72 @@ fn sample_with_cache(path: &Path, query: Query) -> Result<Option<Data>> {
     }
     cache.data.sample(query)
 }
-
 fn sample_without_cache(path: &Path, query: Query) -> Result<Data> {
-    let identity = collection_identity(path)?;
+    let mut identity = collection_identity(path)?;
     let mut guard = lock(&CACHE);
-    let _ = guard.take();
-    let conn = match open_readonly(path) {
-        Ok(conn) => conn,
-        Err(error) if is_locked(&error) => return sample_copy(path, query),
-        Err(error) => return Err(error.into()),
-    };
-    let (sample, data) = match SampleData::from_conn(&conn, query) {
-        Ok(result) => result,
-        Err(error) if is_sample_locked(&error) => {
-            drop(conn);
-            return sample_copy(path, query);
+    let (mut workers, mut workers_stamp) = match guard.take() {
+        Some(cache) => {
+            let stamp = file_stamp(path).ok().flatten();
+            let reusable = cache.path == path
+                && cache.workers_stamp.is_some_and(|saved| {
+                    stamp.is_some_and(|now| saved.same_file(now))
+                });
+            if reusable {
+                (cache.workers, cache.workers_stamp)
+            } else {
+                (Vec::new(), None)
+            }
         }
-        Err(error) => return Err(error),
+        None => (Vec::new(), None),
     };
-    drop(conn);
-    *guard = Some(Cache {
-        path: path.to_path_buf(),
-        identity,
-        data: sample,
-    });
-    Ok(data)
+    let mut attempt: usize = 0;
+    loop {
+        let conn = match open_readonly(path) {
+            Ok(conn) => conn,
+            Err(error) if is_locked(&error) => return sample_copy(path, query),
+            Err(error) => return Err(error.into()),
+        };
+        let (data, sample, next_workers) =
+            match SampleData::from_conn(conn, path, query, workers) {
+                Ok(result) => result,
+                Err(error) if is_sample_locked(&error) => {
+                    return sample_copy(path, query);
+                }
+                Err(error) => return Err(error),
+            };
+        workers = next_workers;
+
+        let observed = collection_identity(path).ok();
+        if observed.as_ref() == Some(&identity) {
+            *guard = Some(Cache {
+                path: path.to_path_buf(),
+                identity,
+                data,
+                workers,
+                workers_stamp: workers_stamp
+                    .or_else(|| file_stamp(path).ok().flatten()),
+            });
+            return Ok(sample);
+        }
+        if attempt >= 1 {
+            // The collection changed during the last allowed attempt. Return
+            // the counts, but never cache a sample that mixes states.
+            drop(workers);
+            return Ok(sample);
+        }
+        if let Some(latest) = observed {
+            identity = latest;
+        }
+        workers.clear();
+        workers_stamp = None;
+        attempt = attempt.saturating_add(1);
+    }
 }
 
 fn is_sample_locked(error: &Error) -> bool {
     error
         .downcast_ref::<rusqlite::Error>()
         .is_some_and(is_locked)
-}
-
-fn open_readonly(path: &Path) -> rusqlite::Result<Connection> {
-    let flags =
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(path, flags)?;
-    conn.busy_timeout(Duration::from_secs(1))?;
-    // Reading the row also rejects a file that is not an Anki collection.
-    conn.query_row("select 1 from col limit 1", [], |_| Ok(()))?;
-    Ok(conn)
 }
 
 fn is_locked(error: &rusqlite::Error) -> bool {
@@ -432,16 +701,32 @@ impl Drop for TempDir {
 }
 
 fn sample_connection(conn: &Connection, query: Query) -> Result<Data> {
-    let (_, data) = SampleData::from_conn(conn, query)?;
-    Ok(data)
+    let config = CollectionConfig::read(conn)?;
+    let (days, next_day) = timing_from(&config, query.now, query.current_west)?;
+    let cards = CardIndex::from_conn(conn)?;
+    let completed = completed_count(conn, next_day)?;
+    Ok(cards.data(query, (days, completed)))
 }
 
-fn completed_count(conn: &Connection, next_day: i64) -> Result<i64> {
-    Ok(conn.query_row(
+fn completed_count(conn: &Connection, next_day: i64) -> rusqlite::Result<i64> {
+    conn.query_row(
         "SELECT count(*) FROM revlog WHERE id >= ? AND type BETWEEN 0 AND 3",
         (completed_threshold(next_day),),
         |row| row.get::<_, i64>(0),
-    )?)
+    )
+}
+
+fn completed_count_range(
+    conn: &Connection,
+    low: i64,
+    high: i64,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT count(*) FROM revlog
+         WHERE id BETWEEN ? AND ? AND type BETWEEN 0 AND 3",
+        (low, high),
+        |row| row.get::<_, i64>(0),
+    )
 }
 
 #[cfg(unix)]
@@ -816,7 +1101,7 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE col (crt INTEGER);
                  CREATE TABLE config (key TEXT PRIMARY KEY, val);
-                 CREATE TABLE cards (queue INTEGER, due INTEGER);
+                 CREATE TABLE cards (id INTEGER PRIMARY KEY, queue INTEGER, due INTEGER);
                  CREATE TABLE revlog (id INTEGER, type INTEGER);",
             )
             .expect("schema");
@@ -828,7 +1113,7 @@ mod tests {
             .expect("col row");
         set(&writer, "schedVer", "1");
         writer
-            .execute("INSERT INTO cards (queue, due) VALUES (0, 0)", [])
+            .execute("INSERT INTO cards (id, queue, due) VALUES (1, 0, 0)", [])
             .expect("card");
         drop(writer);
 
@@ -839,7 +1124,7 @@ mod tests {
 
         let writer = Connection::open(&path).expect("collection");
         writer
-            .execute("INSERT INTO cards (queue, due) VALUES (0, 0)", [])
+            .execute("INSERT INTO cards (id, queue, due) VALUES (2, 0, 0)", [])
             .expect("new card");
         drop(writer);
 
@@ -879,5 +1164,74 @@ mod tests {
         let data = sample_connection(&conn, query(false, now)).expect("sample");
 
         assert_eq!(data.at, now);
+    }
+
+    fn collection_with_cards(path: &Path, cards: i64, now: i64) {
+        let writer = Connection::open(path).expect("collection");
+        writer
+            .execute_batch(
+                "CREATE TABLE col (crt INTEGER);
+                 CREATE TABLE config (key TEXT PRIMARY KEY, val);
+                 CREATE TABLE cards (id INTEGER PRIMARY KEY, queue INTEGER, due INTEGER);
+                 CREATE TABLE revlog (id INTEGER, type INTEGER);",
+            )
+            .expect("schema");
+        writer
+            .execute(
+                "INSERT INTO col (crt) VALUES (?)",
+                (now.saturating_sub(3600),),
+            )
+            .expect("col row");
+        set(&writer, "schedVer", "1");
+        for id in 1..=cards {
+            writer
+                .execute(
+                    "INSERT INTO cards (id, queue, due) VALUES (?1, 0, 0)",
+                    [id],
+                )
+                .expect("card");
+        }
+    }
+
+    #[test]
+    fn test_sample_switching_collections_uses_fresh_connections() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = env::temp_dir()
+            .join(format!("banki-paths-{}-{nanos}", process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let left = dir.join("left.anki2");
+        let right = dir.join("right.anki2");
+        let now = unix_seconds();
+        collection_with_cards(&left, 1, now);
+        collection_with_cards(&right, 2, now);
+
+        assert_eq!(sample(&left, true, now).expect("left").new, 1);
+        assert_eq!(sample(&right, true, now).expect("right").new, 2);
+        assert_eq!(sample(&left, true, now).expect("left again").new, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sample_replaced_collection_uses_fresh_connections() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = env::temp_dir()
+            .join(format!("banki-replaced-{}-{nanos}", process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("collection.anki2");
+        let replacement = dir.join("replacement.anki2");
+        let now = unix_seconds();
+        collection_with_cards(&path, 1, now);
+        collection_with_cards(&replacement, 2, now);
+
+        assert_eq!(sample(&path, true, now).expect("before").new, 1);
+        fs::rename(&replacement, &path).expect("replace collection");
+        assert_eq!(sample(&path, true, now).expect("after").new, 2);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
