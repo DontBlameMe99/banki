@@ -28,9 +28,12 @@ enough. Wait for a published crate version.
 
 Run **Actions → Release** with `minor` for a feature, or `patch` for a
 dependency-only update. The release workflow bumps `Cargo.toml` and
-`catalog.toml`, rebuilds the static helper, regenerates `banki/`, commits
-everything including `banki/banki-helper`, pushes to `main`, and creates the
-GitHub release.
+`catalog.toml`, rebuilds the static helper, regenerates `banki/`, opens and
+merges a version-bump pull request, and creates the GitHub release. The release
+workflow requires a `BANKI_TOKEN` repository secret with fine-grained
+`Contents: read and write` and `Pull requests: read and write`. The main ruleset
+cannot merge a pull request whose changes come from the Actions app, and a PAT
+push also makes the pull request checks run.
 
 ## Deploy on NixOS
 
