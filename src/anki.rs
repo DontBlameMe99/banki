@@ -585,14 +585,24 @@ fn sample_without_cache(path: &Path, query: Query) -> Result<Data> {
     loop {
         let conn = match open_readonly(path) {
             Ok(conn) => conn,
-            Err(error) if is_locked(&error) => return sample_copy(path, query),
+            Err(error) if is_locked(&error) => {
+                return sample_copy_cached(
+                    path,
+                    query,
+                    (identity, &mut guard, workers, workers_stamp),
+                );
+            }
             Err(error) => return Err(error.into()),
         };
         let (data, sample, next_workers) =
             match SampleData::from_conn(conn, path, query, workers) {
                 Ok(result) => result,
                 Err(error) if is_sample_locked(&error) => {
-                    return sample_copy(path, query);
+                    return sample_copy_cached(
+                        path,
+                        query,
+                        (identity, &mut guard, Vec::new(), None),
+                    );
                 }
                 Err(error) => return Err(error),
             };
@@ -644,8 +654,34 @@ fn is_locked(error: &rusqlite::Error) -> bool {
     }
 }
 
+type CopyCache<'a> = (
+    CollectionIdentity,
+    &'a mut Option<Cache>,
+    Vec<Connection>,
+    Option<FileStamp>,
+);
+
+fn sample_copy_cached(
+    path: &Path,
+    query: Query,
+    state: CopyCache<'_>,
+) -> Result<Data> {
+    let (identity, guard, workers, workers_stamp) = state;
+    let (sample, data) = sample_copy(path, query)?;
+    if collection_identity(path).ok().as_ref() == Some(&identity) {
+        *guard = Some(Cache {
+            path: path.to_path_buf(),
+            identity,
+            data: sample,
+            workers,
+            workers_stamp,
+        });
+    }
+    Ok(data)
+}
+
 /// Counts a copy of the collection, for when Anki holds the write lock.
-fn sample_copy(path: &Path, query: Query) -> Result<Data> {
+fn sample_copy(path: &Path, query: Query) -> Result<(SampleData, Data)> {
     let directory = TempDir::new()?;
     let name = path.file_name().ok_or("collection path has no file name")?;
     let target = directory.0.join(name);
@@ -657,7 +693,7 @@ fn sample_copy(path: &Path, query: Query) -> Result<Data> {
 
     let conn = Connection::open(&target)?;
     conn.busy_timeout(Duration::from_secs(1))?;
-    sample_connection(&conn, query)
+    sample_pair(&conn, query)
 }
 
 fn copy_writable(from: &Path, to: &Path) -> io::Result<()> {
@@ -700,12 +736,27 @@ impl Drop for TempDir {
     }
 }
 
-fn sample_connection(conn: &Connection, query: Query) -> Result<Data> {
+fn sample_pair(conn: &Connection, query: Query) -> Result<(SampleData, Data)> {
     let config = CollectionConfig::read(conn)?;
     let (days, next_day) = timing_from(&config, query.now, query.current_west)?;
     let cards = CardIndex::from_conn(conn)?;
     let completed = completed_count(conn, next_day)?;
-    Ok(cards.data(query, (days, completed)))
+    let data = cards.data(query, (days, completed));
+    Ok((
+        SampleData {
+            config,
+            cards,
+            completed_day: next_day,
+            completed,
+        },
+        data,
+    ))
+}
+
+#[cfg(test)]
+fn sample_connection(conn: &Connection, query: Query) -> Result<Data> {
+    let (_, data) = sample_pair(conn, query)?;
+    Ok(data)
 }
 
 fn completed_count(conn: &Connection, next_day: i64) -> rusqlite::Result<i64> {
@@ -875,6 +926,7 @@ mod tests {
     use noctalia_rs::unix_seconds;
 
     use super::*;
+    static TEST_CACHE_SERIAL: Mutex<()> = Mutex::new(());
 
     fn database() -> Connection {
         let conn = Connection::open_in_memory().expect("memory database");
@@ -1087,6 +1139,7 @@ mod tests {
 
     #[test]
     fn test_sample_cache_tracks_collection_changes() {
+        let _serial = lock(&TEST_CACHE_SERIAL);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1195,6 +1248,7 @@ mod tests {
 
     #[test]
     fn test_sample_switching_collections_uses_fresh_connections() {
+        let _serial = lock(&TEST_CACHE_SERIAL);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1216,6 +1270,7 @@ mod tests {
 
     #[test]
     fn test_sample_replaced_collection_uses_fresh_connections() {
+        let _serial = lock(&TEST_CACHE_SERIAL);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1232,6 +1287,40 @@ mod tests {
         assert_eq!(sample(&path, true, now).expect("before").new, 1);
         fs::rename(&replacement, &path).expect("replace collection");
         assert_eq!(sample(&path, true, now).expect("after").new, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_locked_collection_copy_is_cached() {
+        let _serial = lock(&TEST_CACHE_SERIAL);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = env::temp_dir()
+            .join(format!("banki-locked-{}-{nanos}", process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("collection.anki2");
+        let now = unix_seconds();
+        collection_with_cards(&path, 1, now);
+        let writer = Connection::open(&path).expect("writer");
+        writer
+            .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .expect("exclusive lock");
+        writer
+            .execute("UPDATE col SET crt = crt", [])
+            .expect("hold lock");
+
+        let first = sample(&path, true, now).expect("first sample");
+        {
+            let guard = lock(&CACHE);
+            let cached = guard.as_ref().expect("cached locked copy");
+            assert_eq!(cached.path, path);
+        }
+        let second = sample(&path, true, now).expect("cached sample");
+
+        assert_eq!(first, second);
+        drop(writer);
         let _ = fs::remove_dir_all(&dir);
     }
 }
