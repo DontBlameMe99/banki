@@ -151,7 +151,7 @@ impl CardIndex {
     fn add(&mut self, queue: i64, due: i64) {
         match queue {
             0 => self.new = self.new.saturating_add(1),
-            1 => self.intraday_learning.push(due),
+            1 | 4 => self.intraday_learning.push(due),
             2 => self.reviews.push(due),
             3 => self.day_learning.push(due),
             _ => {}
@@ -713,6 +713,25 @@ mod tests {
 
         assert_eq!(data.new, 0);
         assert_eq!(data.remaining, 0);
+    }
+
+    #[test]
+    fn test_preview_repeat_counts_as_learning() {
+        let conn = database();
+        let now = 1_000_000;
+        conn.execute("INSERT INTO col (crt) VALUES (?)", (now - 3600,))
+            .expect("col row");
+        set(&conn, "schedVer", "1");
+        conn.execute_batch(
+            "INSERT INTO cards (queue, due) VALUES
+               (4, 999999), (4, 1000001), (-1, 0);",
+        )
+        .expect("cards");
+
+        let data = sample_connection(&conn, query(true, now)).expect("sample");
+
+        assert_eq!(data.learning, 1);
+        assert_eq!(data.remaining, 1);
     }
 
     #[test]

@@ -47,6 +47,10 @@ def sync_collection(path, key_path, lock_path=""):
     if not key:
         raise RuntimeError("sync enabled without a key")
 
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        raise RuntimeError(f"collection not found: {path}")
+
     lock = None
     if lock_path:
         lock = open(os.path.expanduser(lock_path), "w")
