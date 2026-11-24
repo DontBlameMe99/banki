@@ -91,7 +91,7 @@ fn plugin_with_translations() -> Plugin {
 )]
 fn dispatch(ctx: &Context) -> Result<Vec<Op>> {
     match ctx.event.as_str() {
-        "render" | "update" => Ok(refresh(ctx)),
+        "render" | "update" | "refresh" | "resume" => Ok(refresh(ctx)),
         "ipc" if ctx.payload_str("event").as_deref() == Some("refresh") => {
             Ok(refresh(ctx))
         }
@@ -142,4 +142,65 @@ fn cached() -> Option<anki::Data> {
 
 fn store(data: anki::Data) {
     *lock(&DATA) = Some(data);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::test_support::context;
+
+    fn due_collection(dir: &Path) -> PathBuf {
+        let _ = fs::create_dir_all(dir);
+        let path = dir.join("collection.anki2");
+        let conn = rusqlite::Connection::open(&path).expect("collection");
+        conn.execute_batch(
+            "CREATE TABLE col (crt INTEGER);
+             CREATE TABLE config (key TEXT PRIMARY KEY, val);
+             CREATE TABLE cards (queue INTEGER, due INTEGER);
+             CREATE TABLE revlog (id INTEGER, type INTEGER);
+             INSERT INTO col (crt) VALUES (0);
+             INSERT INTO config (key, val) VALUES ('schedVer', '1');
+             INSERT INTO cards (queue, due) VALUES (2, 0), (2, 0), (2, 0);",
+        )
+        .expect("schema");
+        path
+    }
+
+    fn rendered_number(ops: &[Op]) -> Option<String> {
+        let render =
+            ops.iter().find(|op| matches!(op, Op::BarRender { .. }))?;
+        let Op::BarRender { tree } = render else {
+            return None;
+        };
+        let value = serde_json::to_value(tree).ok()?;
+        let label = value["children"]
+            .as_array()?
+            .iter()
+            .find(|child| child["kind"] == "label")?;
+        label["props"]["text"].as_str().map(str::to_owned)
+    }
+
+    #[test]
+    fn test_refresh_events_read_counts() {
+        let dir =
+            env::temp_dir().join(format!("banki-cards-{}", process::id()));
+        let collection = due_collection(&dir);
+        let mut ctx = context(
+            json!({ "collection_path": collection.to_str().unwrap_or_default() }),
+            json!({ "bar": { "vertical": false } }),
+        );
+
+        for event in ["render", "refresh", "resume"] {
+            ctx.event = event.to_owned();
+            let ops = dispatch(&ctx).expect("dispatch");
+            assert_eq!(rendered_number(&ops).as_deref(), Some("3"), "{event}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -63,7 +63,10 @@ Sync is off by default. When enabled, the helper syncs the local collection
 before each check, so changes made on another device appear without opening
 Anki. It needs network access, Python 3, and an AnkiWeb sync key. Put the key in
 the sync key setting, or point the key file setting at a secret managed by sops.
-The key file takes precedence. A full download is accepted automatically. A full
+The key file takes precedence. A key written from the setting is stored in the
+plugin data directory, readable only by your user. Without a key, or with a key
+file that cannot be read, the sync step is skipped and the counts still come
+from the local collection. A full download is accepted automatically. A full
 upload requires a decision in Anki; the widget keeps showing the last known
 count until a check succeeds.
 
