@@ -14,7 +14,7 @@ on:
           - major
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
@@ -24,13 +24,22 @@ jobs:
   release:
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.BANKI_TOKEN }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
           ref: main
           persist-credentials: false
+
+      - name: Check BANKI_TOKEN
+        env:
+          BANKI_TOKEN: ${{ secrets.BANKI_TOKEN }}
+        run: |
+          if [ -z "$BANKI_TOKEN" ]; then
+            echo "BANKI_TOKEN is required: the main ruleset cannot merge an Actions-app pull request" >&2
+            exit 1
+          fi
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -87,21 +96,50 @@ jobs:
       - name: Check the catalog
         run: python3 .github/scripts/check-catalog.py
 
-      - name: Push the version bump to main
+      - name: Land the version bump
         env:
           VERSION: ${{ steps.bump.outputs.version }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          set -euo pipefail
+          branch="release/v$VERSION"
+          git config user.name "DontBlameMe"
+          git config user.email "contact@dontblameme.dev"
+          git switch -c "$branch"
           git add Cargo.toml Cargo.lock catalog.toml banki
           git commit --message "chore: bump version to $VERSION"
-          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:main"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:$branch"
+          number="$(gh pr list --head "$branch" --json number --jq '.[0].number // empty')"
+          if [ -z "$number" ]; then
+            url="$(gh pr create --base main --head "$branch" \
+              --title "chore: bump version to $VERSION" \
+              --body "Bump the plugin version to $VERSION. The static helper and generated plugin were rebuilt and checked by the release workflow.")"
+            number="${url##*/}"
+            case "$number" in
+              ''|*[!0-9]*)
+                echo "could not parse pull request number from $url" >&2
+                exit 1
+                ;;
+            esac
+          fi
+          for _ in 1 2 3 4 5; do
+            if gh pr merge "$number" --squash --delete-branch; then
+              exit 0
+            fi
+            sleep 5
+          done
+          state="$(gh pr view "$number" --json state --jq .state)"
+          if [ "$state" = "MERGED" ]; then
+            exit 0
+          fi
+          gh pr view "$number" --json state,mergeStateStatus >&2 || true
+          exit 1
 
       - name: Create the GitHub release
         env:
           VERSION: ${{ steps.bump.outputs.version }}
         run: |
+          git fetch origin main
           gh release create "v$VERSION" \
             --title "v$VERSION" \
             --generate-notes \
-            --target "$(git rev-parse HEAD)"
+            --target "$(git rev-parse FETCH_HEAD)"
