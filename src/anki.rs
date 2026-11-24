@@ -7,7 +7,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::result::Result as StdResult;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{FixedOffset, Local, TimeZone};
@@ -15,10 +15,13 @@ use rusqlite::ffi::ErrorCode;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
+use crate::lock;
+
 pub type Error = Box<dyn StdError>;
 pub type Result<T> = StdResult<T, Error>;
 
 const SECONDS_PER_DAY: i64 = 86_400;
+const DEFAULT_ROLLOVER_HOUR: i64 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Data {
@@ -38,6 +41,8 @@ struct Query {
     current_west: i64,
 }
 
+/// The parts of `col` and `config` the counts depend on. Kept with the card
+/// index so an unchanged collection is not read twice.
 #[derive(Clone, Eq, PartialEq)]
 struct CollectionConfig {
     crt: i64,
@@ -51,18 +56,16 @@ impl CollectionConfig {
         let crt =
             conn.query_row("SELECT crt FROM col", [], |row| row.get(0))?;
         let scheduler_one = config(conn, "schedVer")?.as_deref() == Some("1");
-        let rollover = match config(conn, "rollover")? {
-            Some(value) if !value.is_empty() => value.parse::<i64>()?,
-            _ => 4,
+        let rollover = rollover_hour(conn)?;
+        let creation_offset = if scheduler_one {
+            None
+        } else {
+            config(conn, "creationOffset")?
         };
         Ok(Self {
             crt,
             rollover,
-            creation_offset: if scheduler_one {
-                None
-            } else {
-                config(conn, "creationOffset")?
-            },
+            creation_offset,
             scheduler_one,
         })
     }
@@ -99,9 +102,9 @@ fn file_stamp(path: &Path) -> io::Result<Option<FileStamp>> {
     }
 }
 
-fn wal_path(path: &Path) -> PathBuf {
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
-    value.push("-wal");
+    value.push(suffix);
     PathBuf::from(value)
 }
 
@@ -114,10 +117,11 @@ fn collection_identity(path: &Path) -> io::Result<CollectionIdentity> {
     };
     Ok(CollectionIdentity {
         database,
-        wal: file_stamp(&wal_path(path))?,
+        wal: file_stamp(&sidecar(path, "-wal"))?,
     })
 }
 
+/// Due times of every card, sorted so a count is a binary search.
 #[derive(Default)]
 struct CardIndex {
     reviews: Vec<i64>,
@@ -144,17 +148,6 @@ impl CardIndex {
         Ok(index)
     }
 
-    fn counts(&self, days: i64, now: i64) -> (i64, i64, i64, i64) {
-        (
-            count_at(&self.reviews, days),
-            count_at(&self.day_learning, days),
-            count_at(&self.intraday_learning, now),
-            self.new,
-        )
-    }
-}
-
-impl CardIndex {
     fn add(&mut self, queue: i64, due: i64) {
         match queue {
             0 => self.new = self.new.saturating_add(1),
@@ -165,13 +158,20 @@ impl CardIndex {
         }
     }
 
+    fn counts(&self, days: i64, now: i64) -> (i64, i64, i64, i64) {
+        (
+            count_at(&self.reviews, days),
+            count_at(&self.day_learning, days),
+            count_at(&self.intraday_learning, now),
+            self.new,
+        )
+    }
+
     fn data(&self, query: Query, counts: (i64, i64)) -> Data {
         let (days, completed) = counts;
-        let (reviews, day_learning, intraday_learning, mut new) =
+        let (reviews, day_learning, intraday_learning, new_cards) =
             self.counts(days, query.now);
-        if !query.include_new {
-            new = 0;
-        }
+        let new = if query.include_new { new_cards } else { 0 };
         let learning = intraday_learning.saturating_add(day_learning);
         let remaining = reviews.saturating_add(learning).saturating_add(new);
         Data {
@@ -235,44 +235,37 @@ struct Cache {
 
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
 
-fn cache_lock() -> MutexGuard<'static, Option<Cache>> {
-    CACHE.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-pub fn now_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
-        })
-}
-
 pub fn collection_path(raw: &str, plugin_dir: &Path) -> Result<PathBuf> {
     let path = expand_path(raw, plugin_dir);
     if !path.as_os_str().is_empty() {
-        if path.is_dir() {
-            return Ok(path.join("collection.anki2"));
-        }
-        return Ok(path);
+        return Ok(if path.is_dir() {
+            path.join("collection.anki2")
+        } else {
+            path
+        });
     }
 
-    let home = env::var_os("HOME").ok_or("HOME is not set")?;
-    let base = PathBuf::from(home).join(".local/share/Anki2");
-    let mut matches = Vec::new();
+    let base = profiles_dir()?;
+    let mut found = Vec::new();
     if let Ok(entries) = fs::read_dir(&base) {
-        matches.extend(
+        found.extend(
             entries
                 .flatten()
                 .map(|entry| entry.path().join("collection.anki2"))
                 .filter(|candidate| candidate.is_file()),
         );
     }
-    matches.sort();
-    match matches.len() {
+    found.sort();
+    match found.len() {
         0 => Err("no Anki collection found".into()),
-        1 => Ok(matches.remove(0)),
+        1 => Ok(found.remove(0)),
         _ => Err("multiple Anki profiles; set collection_path".into()),
     }
+}
+
+fn profiles_dir() -> Result<PathBuf> {
+    let home = env::var_os("HOME").ok_or("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".local/share/Anki2"))
 }
 
 pub fn expand_path(raw: &str, plugin_dir: &Path) -> PathBuf {
@@ -280,15 +273,8 @@ pub fn expand_path(raw: &str, plugin_dir: &Path) -> PathBuf {
     if path.is_empty() {
         return PathBuf::new();
     }
-    if path == "~"
-        && let Some(home) = env::var_os("HOME")
-    {
-        return PathBuf::from(home);
-    }
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = env::var_os("HOME")
-    {
-        return PathBuf::from(home).join(rest);
+    if let Some(expanded) = home_relative(path) {
+        return expanded;
     }
     let value = Path::new(path);
     if value.is_absolute() {
@@ -298,26 +284,13 @@ pub fn expand_path(raw: &str, plugin_dir: &Path) -> PathBuf {
     }
 }
 
-fn open_readonly(path: &Path) -> rusqlite::Result<Connection> {
-    let flags =
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(path, flags)?;
-    conn.busy_timeout(Duration::from_secs(1))?;
-    conn.query_row("select 1 from col limit 1", [], |_| Ok(()))?;
-    Ok(conn)
-}
-
-fn is_locked(error: &rusqlite::Error) -> bool {
-    if let rusqlite::Error::SqliteFailure(inner, message) = error {
-        matches!(
-            inner.code,
-            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
-        ) || message
-            .as_deref()
-            .is_some_and(|text| text.contains("locked"))
-    } else {
-        false
+/// Expands `~` and `~/...`. Returns `None` for every other path.
+fn home_relative(path: &str) -> Option<PathBuf> {
+    let home = PathBuf::from(env::var_os("HOME")?);
+    if path == "~" {
+        return Some(home);
     }
+    path.strip_prefix("~/").map(|rest| home.join(rest))
 }
 
 pub fn sample(path: &Path, include_new: bool, now: i64) -> Result<Data> {
@@ -337,7 +310,7 @@ fn sample_with_cache(path: &Path, query: Query) -> Result<Option<Data>> {
     let Ok(identity) = collection_identity(path) else {
         return Ok(None);
     };
-    let guard = cache_lock();
+    let guard = lock(&CACHE);
     let Some(cache) = guard.as_ref() else {
         return Ok(None);
     };
@@ -349,14 +322,14 @@ fn sample_with_cache(path: &Path, query: Query) -> Result<Option<Data>> {
 
 fn sample_without_cache(path: &Path, query: Query) -> Result<Data> {
     let identity = collection_identity(path)?;
-    let mut guard = cache_lock();
+    let mut guard = lock(&CACHE);
     let _ = guard.take();
     let conn = match open_readonly(path) {
         Ok(conn) => conn,
         Err(error) if is_locked(&error) => return sample_copy(path, query),
         Err(error) => return Err(error.into()),
     };
-    let (data, sample) = match SampleData::from_conn(&conn, query) {
+    let (sample, data) = match SampleData::from_conn(&conn, query) {
         Ok(result) => result,
         Err(error) if is_sample_locked(&error) => {
             drop(conn);
@@ -368,9 +341,9 @@ fn sample_without_cache(path: &Path, query: Query) -> Result<Data> {
     *guard = Some(Cache {
         path: path.to_path_buf(),
         identity,
-        data,
+        data: sample,
     });
-    Ok(sample)
+    Ok(data)
 }
 
 fn is_sample_locked(error: &Error) -> bool {
@@ -379,21 +352,38 @@ fn is_sample_locked(error: &Error) -> bool {
         .is_some_and(is_locked)
 }
 
+fn open_readonly(path: &Path) -> rusqlite::Result<Connection> {
+    let flags =
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)?;
+    conn.busy_timeout(Duration::from_secs(1))?;
+    // Reading the row also rejects a file that is not an Anki collection.
+    conn.query_row("select 1 from col limit 1", [], |_| Ok(()))?;
+    Ok(conn)
+}
+
+fn is_locked(error: &rusqlite::Error) -> bool {
+    if let rusqlite::Error::SqliteFailure(inner, message) = error {
+        matches!(
+            inner.code,
+            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+        ) || message
+            .as_deref()
+            .is_some_and(|text| text.contains("locked"))
+    } else {
+        false
+    }
+}
+
+/// Counts a copy of the collection, for when Anki holds the write lock.
 fn sample_copy(path: &Path, query: Query) -> Result<Data> {
-    let directory = TemporaryDirectory::new()?;
+    let directory = TempDir::new()?;
     let name = path.file_name().ok_or("collection path has no file name")?;
     let target = directory.0.join(name);
-    fs::copy(path, &target)?;
-    make_writable(&target)?;
-    let mut wal_source = path.as_os_str().to_os_string();
-    wal_source.push("-wal");
-    let wal_path = PathBuf::from(wal_source);
-    if wal_path.exists() {
-        let mut wal_name = target.as_os_str().to_os_string();
-        wal_name.push("-wal");
-        let wal_target = PathBuf::from(wal_name);
-        fs::copy(&wal_path, &wal_target)?;
-        make_writable(&wal_target)?;
+    copy_writable(path, &target)?;
+    let wal = sidecar(path, "-wal");
+    if wal.exists() {
+        copy_writable(&wal, &sidecar(&target, "-wal"))?;
     }
 
     let conn = Connection::open(&target)?;
@@ -401,48 +391,41 @@ fn sample_copy(path: &Path, query: Query) -> Result<Data> {
     sample_connection(&conn, query)
 }
 
-struct TemporaryDirectory(PathBuf);
+fn copy_writable(from: &Path, to: &Path) -> io::Result<()> {
+    fs::copy(from, to)?;
+    make_writable(to)
+}
 
-impl TemporaryDirectory {
-    #[expect(
-        clippy::excessive_nesting,
-        reason = "the retry loop reads clearer than an iterator"
-    )]
+struct TempDir(PathBuf);
+
+impl TempDir {
     fn new() -> io::Result<Self> {
-        let base = env::temp_dir();
-        for attempt in 0..100 {
-            let path = base.join(format!("banki-{}-{attempt}", process::id()));
-            if create_directory(&path)? {
-                return Ok(Self(path));
-            }
-        }
-        Err(io::Error::other("could not create a temporary directory"))
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path =
+            env::temp_dir().join(format!("banki-{}-{nanos}", process::id()));
+        create_private_directory(&path)?;
+        Ok(Self(path))
     }
 }
 
 #[cfg(unix)]
-fn create_directory(path: &Path) -> io::Result<bool> {
+fn create_private_directory(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
 
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
-    match builder.create(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error),
-    }
+    builder.create(path)
 }
 
 #[cfg(not(unix))]
-fn create_directory(path: &Path) -> io::Result<bool> {
-    match fs::create_dir(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error),
-    }
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
 }
 
-impl Drop for TemporaryDirectory {
+impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
@@ -483,6 +466,7 @@ const fn completed_threshold(next_day: i64) -> i64 {
         .saturating_mul(1000)
 }
 
+/// Minutes west of UTC, the unit Anki stores time zones in.
 fn current_west(now: i64) -> Option<i64> {
     Local.timestamp_opt(now, 0).earliest().map(|local| {
         i64::from(local.offset().local_minus_utc())
@@ -501,6 +485,7 @@ fn timing(
     timing_from(&config, now, current_west)
 }
 
+/// Days since the collection was created and the start of the next Anki day.
 fn timing_from(
     config: &CollectionConfig,
     now: i64,
@@ -515,51 +500,45 @@ fn timing_from(
         return Ok((days, next_day));
     }
 
-    let mut planned_next_day = None;
-    let days = if let Some(raw) = config.creation_offset.as_deref() {
-        let created_west = raw.parse::<i64>()?;
-        let created = fixed_offset(created_west)?
-            .timestamp_opt(config.crt, 0)
-            .single()
-            .ok_or("invalid collection creation time")?;
-        let local = fixed_offset(current_west)?
-            .timestamp_opt(now, 0)
-            .single()
-            .ok_or("invalid current time")?;
-        let today_rollover =
-            rollover_stamp(now, current_west, config.rollover)?;
-        let rollover_passed = today_rollover <= now;
-        let mut days = local
-            .date_naive()
-            .signed_duration_since(created.date_naive())
-            .num_days();
-        if !rollover_passed {
-            days = days.saturating_sub(1);
-        }
-        let candidate = if rollover_passed {
-            today_rollover.saturating_add(SECONDS_PER_DAY)
+    let Some(raw_offset) = config.creation_offset.as_deref() else {
+        let start = rollover_stamp(config.crt, current_west, config.rollover)?;
+        let today = rollover_stamp(now, current_west, config.rollover)?;
+        let next_day = if today < now {
+            today.saturating_add(SECONDS_PER_DAY)
         } else {
-            today_rollover
+            today
         };
-        planned_next_day = Some(candidate);
-        days.max(0)
-    } else {
-        let crt_rollover =
-            rollover_stamp(config.crt, current_west, config.rollover)?;
-        now.saturating_sub(crt_rollover).div_euclid(SECONDS_PER_DAY)
+        let days = now.saturating_sub(start).div_euclid(SECONDS_PER_DAY);
+        return Ok((days, next_day));
     };
 
-    let next_day = if let Some(value) = planned_next_day {
-        value
+    let created_west = raw_offset.parse::<i64>()?;
+    let created = fixed_offset(created_west)?
+        .timestamp_opt(config.crt, 0)
+        .single()
+        .ok_or("invalid collection creation time")?;
+    let local = fixed_offset(current_west)?
+        .timestamp_opt(now, 0)
+        .single()
+        .ok_or("invalid current time")?;
+    let today = rollover_stamp(now, current_west, config.rollover)?;
+    let elapsed = local
+        .date_naive()
+        .signed_duration_since(created.date_naive())
+        .num_days();
+    let (days, next_day) = if today <= now {
+        (elapsed, today.saturating_add(SECONDS_PER_DAY))
     } else {
-        let value = rollover_stamp(now, current_west, config.rollover)?;
-        if value < now {
-            value.saturating_add(SECONDS_PER_DAY)
-        } else {
-            value
-        }
+        (elapsed.saturating_sub(1), today)
     };
-    Ok((days, next_day))
+    Ok((days.max(0), next_day))
+}
+
+fn rollover_hour(conn: &Connection) -> Result<i64> {
+    match config(conn, "rollover")? {
+        Some(value) if !value.is_empty() => Ok(value.parse()?),
+        _ => Ok(DEFAULT_ROLLOVER_HOUR),
+    }
 }
 
 fn fixed_offset(minutes_west: i64) -> Result<FixedOffset> {
@@ -578,11 +557,10 @@ fn rollover_stamp(timestamp: i64, minutes_west: i64, hour: i64) -> Result<i64> {
         .timestamp_opt(timestamp, 0)
         .single()
         .ok_or("invalid timestamp")?;
-    let rollover_hour = hour.rem_euclid(24);
-    let hour_value = u32::try_from(rollover_hour).unwrap_or(0);
+    let hour_of_day = u32::try_from(hour.rem_euclid(24)).unwrap_or(0);
     let naive = local
         .date_naive()
-        .and_hms_opt(hour_value, 0, 0)
+        .and_hms_opt(hour_of_day, 0, 0)
         .ok_or("invalid rollover hour")?;
     zone.from_local_datetime(&naive)
         .single()
@@ -609,6 +587,8 @@ fn config(conn: &Connection, key: &str) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    use noctalia_rs::unix_seconds;
+
     use super::*;
 
     fn database() -> Connection {
@@ -770,7 +750,7 @@ mod tests {
     fn test_temporary_directory_is_private() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = TemporaryDirectory::new().expect("temp dir");
+        let dir = TempDir::new().expect("temp dir");
         let mode =
             fs::metadata(&dir.0).expect("meta").permissions().mode() & 0o777;
 
@@ -784,6 +764,7 @@ mod tests {
             PathBuf::from("/tmp/collection.anki2")
         );
     }
+
     #[test]
     fn test_card_index_counts_due_cards() {
         let conn = database();
@@ -810,7 +791,7 @@ mod tests {
             .join(format!("banki-cache-{}-{nanos}", process::id()));
         fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("collection.anki2");
-        let now = now_seconds();
+        let now = unix_seconds();
         let writer = Connection::open(&path).expect("collection");
         writer
             .execute_batch(
@@ -847,6 +828,7 @@ mod tests {
         assert_eq!(updated.new, 2);
         let _ = fs::remove_dir_all(&dir);
     }
+
     #[test]
     fn test_scheduler_one_ignores_malformed_creation_offset() {
         let conn = database();
@@ -861,6 +843,7 @@ mod tests {
         assert_eq!(days, 2);
         assert_eq!(next, 1_000_000 + 3 * 86_400);
     }
+
     #[test]
     fn test_scheduler_one_skips_invalid_creation_offset_text() {
         let conn = database();

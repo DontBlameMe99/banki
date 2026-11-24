@@ -29,13 +29,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "banki-helper"
-version = "0.3.0"
-dependencies = [
- "banki",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
