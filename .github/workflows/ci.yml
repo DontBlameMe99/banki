@@ -28,12 +28,39 @@ jobs:
           profile: community
           root: ${{ github.workspace }}
 
-  checks:
-    name: Catalog and Luau
+  rust:
+    name: Rust and generated plugin
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Check generated plugin matches
+        run: |
+          cargo build
+          python3 .github/scripts/emit.py target/debug/banki-helper
+          git diff --exit-code -- \
+            banki/plugin.toml \
+            banki/bar.luau \
+            banki/lib/bridge.luau \
+            banki/translations/en.json \
+            banki/assets/anki.svg \
+            banki/sync.py \
+            banki/LICENSE
 
       - name: Check the catalog matches the manifest
         run: python3 .github/scripts/check-catalog.py
@@ -55,4 +82,4 @@ jobs:
             "https://raw.githubusercontent.com/noctalia-dev/official-plugins/$DEFINITIONS_COMMIT/noctalia.d.luau"
 
       - name: Analyze Luau
-        run: luau-lsp analyze --definitions="$RUNNER_TEMP/noctalia.d.luau" banki
+        run: luau-lsp analyze --definitions="$RUNNER_TEMP/noctalia.d.luau" --ignore 'banki/lib/bridge.luau' banki

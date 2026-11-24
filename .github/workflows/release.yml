@@ -31,6 +31,14 @@ jobs:
         with:
           ref: main
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
       - name: Bump the version
         id: bump
         env:
@@ -43,6 +51,17 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Build the helper
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Emit the plugin
+        run: |
+          python3 .github/scripts/emit.py target/x86_64-unknown-linux-musl/release/banki-helper
+          mv -f target/x86_64-unknown-linux-musl/release/banki-helper banki/banki-helper
+
       - name: Check the catalog
         run: python3 .github/scripts/check-catalog.py
 
@@ -52,7 +71,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add banki/plugin.toml catalog.toml
+          git add Cargo.toml Cargo.lock catalog.toml banki
           git commit --message "chore: bump version to $VERSION"
           git push origin "HEAD:main"
 
