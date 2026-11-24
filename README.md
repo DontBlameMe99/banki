@@ -39,6 +39,18 @@ cp target/x86_64-unknown-linux-musl/release/banki-helper banki/banki-helper
 See [docs/noctalia-plugins.md](docs/noctalia-plugins.md) for the Noctalia plugin
 API documentation and [AGENTS.md](AGENTS.md) for the checks.
 
+## Benchmark
+
+Generate a repeatable Anki-shaped collection and time the helper's read path:
+
+```sh
+python3 .github/scripts/bench-fixture.py .tmp/collection.anki2
+target/x86_64-unknown-linux-musl/release/banki-helper bench .tmp/collection.anki2 1000 1
+```
+
+The reported `first` time includes building the in-memory card index. Median
+and p95 measure refreshes against an unchanged collection.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).

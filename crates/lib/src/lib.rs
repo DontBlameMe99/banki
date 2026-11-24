@@ -416,6 +416,10 @@ fn command_bench(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let iterations = iterations_arg.parse::<usize>().unwrap_or(1000);
+    if iterations == 0 {
+        eprintln!("iterations must be at least 1");
+        return ExitCode::FAILURE;
+    }
     let include_new = args.get(3).is_some_and(|value| value == "1");
     let path = match anki::collection_path(collection, Path::new(".")) {
         Ok(path) => path,
@@ -425,16 +429,26 @@ fn command_bench(args: &[String]) -> ExitCode {
         }
     };
     let now = anki::now_seconds();
-    let mut samples = Vec::with_capacity(iterations);
-    for _ in 0..iterations {
+    let mut samples = Vec::with_capacity(iterations.saturating_sub(1));
+    let mut first = 0.0;
+    for index in 0..iterations {
         let start = Instant::now();
         if let Err(error) = anki::sample(&path, include_new, now) {
             eprintln!("{error}");
             return ExitCode::FAILURE;
         }
-        samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
+        let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0;
+        if index == 0 {
+            first = elapsed;
+        } else {
+            samples.push(elapsed);
+        }
     }
     samples.sort_by(f64::total_cmp);
+    if samples.is_empty() {
+        println!("n=0 first={first:.1}us median=n/a p95=n/a min=n/a max=n/a");
+        return ExitCode::SUCCESS;
+    }
     let at = |percent: usize| {
         let rank = samples
             .len()
@@ -445,8 +459,9 @@ fn command_bench(args: &[String]) -> ExitCode {
         samples.get(index).copied().unwrap_or(0.0)
     };
     println!(
-        "n={} median={:.1}us p95={:.1}us min={:.1}us max={:.1}us",
+        "n={} first={:.1}us median={:.1}us p95={:.1}us min={:.1}us max={:.1}us",
         samples.len(),
+        first,
         at(50),
         at(95),
         samples.first().copied().unwrap_or(0.0),
