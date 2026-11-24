@@ -17,8 +17,9 @@ CODE_NAMES = {"Dockerfile", "Justfile", "Makefile"}
 HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 CODE_SPAN = re.compile(r"(`+)(?!`).*?(?<!`)\1(?!`)", re.DOTALL)
 FENCE = re.compile(r"(`{3,}|~{3,})(.*)")
-BLOCKQUOTE = re.compile(r"^\s*(?:>\s?)+")
-LIST_ITEM = re.compile(r"^( *)(?:[-*+]|\d+[.)])\s+")
+BLOCKQUOTE = re.compile(r"^[ \t]*(?:>[ \t]?)+")
+QUOTE_PREFIX = re.compile(r"^([ \t]*(?:>[ \t]?)+)")
+LIST_ITEM = re.compile(r"^( *)(?:[-*+]|\d+[.)])[ \t]+")
 MARKDOWN_IMAGE = re.compile(
     r"""!\[[^\]]*\]\(\s*(?:<([^>]+)>|([^\s)]+))(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)"""
 )
@@ -29,55 +30,93 @@ HTML_IMAGE = re.compile(
 REFERENCE_IMAGE = re.compile(r"!\[([^\]]*)\]\[([^\]]*)\]")
 SHORTCUT_IMAGE = re.compile(r"!\[([^\]]+)\](?![ \t]*\()(?![ \t]*\[)")
 LINK_DEFINITION = re.compile(
-    r"^\s{0,3}\[([^\]]+)\]:\s*(?:<([^>]+)>|(\S+))",
+    r"^[ \t]{0,3}\[([^\]]+)\]:\s*(?:<([^>]+)>|([^\s]+))"
+    r"(?:[ \t]+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?[ \t]*$",
     re.MULTILINE,
 )
+
+
+def rendered_matches(pattern, body):
+    """Yield image matches whose exclamation mark is not escaped."""
+    for match in pattern.finditer(body):
+        start = match.start()
+        if body[start] != "!":
+            yield match
+            continue
+        index = start - 1
+        backslashes = 0
+        while index >= 0 and body[index] == "\\":
+            backslashes += 1
+            index -= 1
+        if backslashes % 2 == 0:
+            yield match
 
 
 def visible_lines(body):
     """Drop comments and code that GitHub does not render as images."""
     body = HTML_COMMENT.sub("", body)
     fence = None
+    fence_quote = ""
+    fence_indent = 0
     paragraph = False
     list_indent = None
     kept = []
     for line in body.splitlines():
+        quote_match = QUOTE_PREFIX.match(line)
+        quote = quote_match.group(1) if quote_match else ""
         content = BLOCKQUOTE.sub("", line)
-        marker = FENCE.match(content.lstrip())
-        if fence is None:
-            if marker:
-                fence = marker.group(1)
-                paragraph = False
-                list_indent = None
-                continue
-            item = LIST_ITEM.match(content)
-            if item:
-                list_indent = len(item.group(0))
-                paragraph = True
-                kept.append(line)
-                continue
-            if not content.strip():
-                paragraph = False
-                list_indent = None
-                kept.append(line)
-                continue
-            indent = 4 if content.startswith("\t") else len(content) - len(content.lstrip(" "))
-            if list_indent is not None and indent >= list_indent + 4:
-                continue
-            if indent >= 4 and not paragraph and list_indent is None:
-                continue
-            kept.append(line)
-            paragraph = True
-            continue
-        if (
-            marker
-            and marker.group(1)[0] == fence[0]
-            and len(marker.group(1)) >= len(fence)
-            and not marker.group(2).strip()
-        ):
-            fence = None
-    return CODE_SPAN.sub("", "\n".join(kept))
+        item = LIST_ITEM.match(content)
+        marker_line = content[item.end():] if item else content
+        marker = FENCE.match(marker_line.lstrip())
 
+        if fence is not None:
+            if quote.count(">") != fence_quote.count(">"):
+                fence = None
+                paragraph = False
+                list_indent = None
+            elif len(marker_line) - len(marker_line.lstrip(" ")) < fence_indent:
+                fence = None
+                paragraph = False
+                list_indent = None
+            else:
+                if (
+                    marker
+                    and marker.group(1)[0] == fence[0]
+                    and len(marker.group(1)) >= len(fence)
+                    and not marker.group(2).strip()
+                ):
+                    fence = None
+                    fence_quote = ""
+                    fence_indent = 0
+                    paragraph = False
+                    list_indent = None
+                continue
+
+        if marker:
+            fence = marker.group(1)
+            fence_quote = quote
+            fence_indent = len(marker_line) - len(marker_line.lstrip(" "))
+            paragraph = False
+            list_indent = None
+            continue
+        if item:
+            list_indent = item.end()
+            paragraph = True
+            kept.append(content)
+            continue
+        if not content.strip():
+            paragraph = False
+            list_indent = None
+            kept.append(content)
+            continue
+        indent = 4 if content.startswith("\t") else len(content) - len(content.lstrip(" "))
+        if list_indent is not None and indent >= list_indent + 4:
+            continue
+        if indent >= 4 and not paragraph and list_indent is None:
+            continue
+        kept.append(content)
+        paragraph = True
+    return CODE_SPAN.sub("", "\n".join(kept))
 
 def normalized_label(label):
     return " ".join(label.strip().lower().split())
@@ -87,7 +126,7 @@ def embedded_images(body):
     body = visible_lines(body)
     sources = []
     for pattern in (MARKDOWN_IMAGE, HTML_IMAGE):
-        for match in pattern.finditer(body):
+        for match in rendered_matches(pattern, body):
             source = next((group for group in match.groups() if group), "").strip()
             if source and source not in sources:
                 sources.append(source)
@@ -101,9 +140,9 @@ def embedded_images(body):
                 definitions[label] = source
 
     labels = []
-    for match in REFERENCE_IMAGE.finditer(body):
+    for match in rendered_matches(REFERENCE_IMAGE, body):
         labels.append(match.group(2) or match.group(1))
-    for match in SHORTCUT_IMAGE.finditer(body):
+    for match in rendered_matches(SHORTCUT_IMAGE, body):
         labels.append(match.group(1))
     for label in labels:
         source = definitions.get(normalized_label(label))
