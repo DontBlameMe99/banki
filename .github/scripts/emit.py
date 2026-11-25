@@ -28,6 +28,21 @@ entry_id = f"{manifest['id']}:{manifest['widget'][0]['id']}"
 bar = ROOT / "banki/bar.luau"
 text = bar.read_text()
 load = 'bridge.call("render", { source = "load" })'
+setup = next(
+    (line for line in text.splitlines() if line.startswith("bridge.setup(")),
+    None,
+)
+if setup is None:
+    raise SystemExit("emit.py: generated entry no longer sets up the bridge")
+# The entry owns the timer so a failed first helper response cannot strand it.
+interval = (
+    "local function refreshInterval()\n"
+    '  local seconds = tonumber(noctalia.getConfig("refresh_seconds")) or 600\n'
+    "  noctalia.setUpdateInterval(math.max(seconds, 5) * 1000)\n"
+    "end\n"
+    "refreshInterval()"
+)
+text = text.replace(setup, setup + "\n" + interval, 1)
 waiting = (
     "local waiting = barWidget.isVertical() and ui.column or ui.row\n"
     "barWidget.setVisible(true)\n"
@@ -40,6 +55,16 @@ waiting = (
 if load not in text:
     raise SystemExit("emit.py: generated entry no longer loads the render")
 text = text.replace(load, waiting + "\n" + load)
+config_changed = 'function onConfigChanged() bridge.call("config_changed") end'
+if config_changed not in text:
+    raise SystemExit("emit.py: generated entry no longer has onConfigChanged")
+text = text.replace(
+    config_changed,
+    "function onConfigChanged()\n"
+    "  refreshInterval()\n"
+    '  bridge.call("config_changed")\n'
+    "end",
+)
 right = 'function onRightClick() bridge.call("right_click") end'
 direct = (
     "function onRightClick()\n"

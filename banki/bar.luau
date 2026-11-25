@@ -3,6 +3,11 @@
 
 local bridge = require("./lib/bridge.luau")
 bridge.setup("banki", { "sync_enabled", "sync_key", "sync_key_file", "collection_path", "refresh_seconds", "include_new", "hide_icon", "hide_text", "hide_on_complete", "follow_accent" })
+local function refreshInterval()
+  local seconds = tonumber(noctalia.getConfig("refresh_seconds")) or 600
+  noctalia.setUpdateInterval(math.max(seconds, 5) * 1000)
+end
+refreshInterval()
 
 function onClick() bridge.call("click") end
 function onRightClick()
@@ -14,7 +19,10 @@ function onScroll(axis, steps, startsGesture) bridge.call("scroll", { axis = axi
 function onHover(hovered) bridge.call("hover", { hovered = hovered }) end
 function onKey(chord, pressed, repeated) bridge.call("key", { chord = chord, pressed = pressed, repeated = repeated }) end
 function onIpc(event, payload) bridge.call("ipc", { event = event, payload = payload }) end
-function onConfigChanged() bridge.call("config_changed") end
+function onConfigChanged()
+  refreshInterval()
+  bridge.call("config_changed")
+end
 function onOutputsChanged() bridge.call("outputs_changed") end
 function onEnable() bridge.call("enable") end
 function onDisable() bridge.call("disable") end
