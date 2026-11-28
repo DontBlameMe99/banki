@@ -108,6 +108,9 @@ The helper opens read-only connections for a cold refresh, then keeps card due
 times and the completed count in memory. It rebuilds them when the collection
 changes. An unchanged refresh on a 50,000-card fixture takes about 0.003 ms.
 
+The card index also survives Anki's day rollover, so that refresh only
+recounts completed work.
+
 While Anki holds its exclusive lock, the helper reads a temporary copy of the
 collection and its write-ahead log. It now caches that copy when the source
 files stay unchanged during the read. Repeated locked refreshes fell from a
