@@ -51,6 +51,10 @@ The reported `first` time includes building the in-memory card index. Median
 and p95 measure refreshes against an unchanged collection. `TZ=Etc/GMT-2`
 aligns the host timezone with the fixture's Anki day boundary.
 
+Pass `at` to use a fixed Unix timestamp. Pass `step_seconds` to advance it on
+each iteration. Choose timestamps on opposite sides of the collection's next
+rollover to measure that transition.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).

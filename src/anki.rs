@@ -2,6 +2,7 @@ use std::env;
 use std::error::Error as StdError;
 use std::fs;
 use std::io;
+use std::mem;
 use std::num::NonZero;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -26,6 +27,7 @@ pub type Result<T> = StdResult<T, Error>;
 const SECONDS_PER_DAY: i64 = 86_400;
 const DEFAULT_ROLLOVER_HOUR: i64 = 4;
 const MMAP_SIZE: i64 = 1_073_741_824;
+const LOCK_WAIT: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Data {
@@ -322,6 +324,9 @@ fn run_chunks<T: Send + 'static>(
     available: Vec<Connection>,
     query: ChunkQuery<T>,
 ) -> rusqlite::Result<ChunkOutput<T>> {
+    if bounds.is_empty() {
+        return Ok((Vec::new(), available));
+    }
     let (sender, receiver) = mpsc::channel();
     let (values, workers) = thread::scope(|scope| {
         let mut handles = Vec::new();
@@ -368,11 +373,6 @@ fn read_in_parallel(
     next_day: i64,
     available: Vec<Connection>,
 ) -> rusqlite::Result<(CardIndex, i64, Vec<Connection>)> {
-    let threshold = completed_threshold(next_day);
-    let last_review: Option<i64> =
-        conn.query_row("SELECT max(id) FROM revlog", [], |row| {
-            row.get::<_, Option<i64>>(0)
-        })?;
     let first_card: Option<i64> =
         conn.query_row("SELECT min(id) FROM cards", [], |row| {
             row.get::<_, Option<i64>>(0)
@@ -396,6 +396,27 @@ fn read_in_parallel(
     }
     cards.sort();
 
+    let (completed, reused) =
+        completed_count_parallel(path, next_day, workers)?;
+    Ok((cards, completed, reused))
+}
+
+fn completed_count_parallel(
+    path: &Path,
+    next_day: i64,
+    mut workers: Vec<Connection>,
+) -> rusqlite::Result<(i64, Vec<Connection>)> {
+    if workers.is_empty() {
+        workers.push(open_worker(path)?);
+    }
+    let threshold = completed_threshold(next_day);
+    let worker = workers
+        .first()
+        .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+    let last_review: Option<i64> =
+        worker.query_row("SELECT max(id) FROM revlog", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?;
     let review_bounds = match last_review {
         Some(last) if last >= threshold => chunk_bounds(threshold, last),
         _ => Vec::new(),
@@ -403,7 +424,7 @@ fn read_in_parallel(
     let (counts, reused) =
         run_chunks(path, &review_bounds, workers, completed_count_range)?;
     let completed = counts.into_iter().fold(0_i64, i64::saturating_add);
-    Ok((cards, completed, reused))
+    Ok((completed, reused))
 }
 
 struct SampleData {
@@ -441,15 +462,6 @@ impl SampleData {
             data,
             reused,
         ))
-    }
-
-    fn sample(&self, query: Query) -> Result<Option<Data>> {
-        let (days, next_day) =
-            timing_from(&self.config, query.now, query.current_west)?;
-        if next_day != self.completed_day {
-            return Ok(None);
-        }
-        Ok(Some(self.cards.data(query, (days, self.completed))))
     }
 }
 
@@ -525,13 +537,13 @@ fn open_worker(path: &Path) -> rusqlite::Result<Connection> {
     let flags =
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)?;
+    conn.busy_timeout(LOCK_WAIT)?;
     let _ = conn.pragma_update(None, "mmap_size", MMAP_SIZE);
     Ok(conn)
 }
 
 fn open_readonly(path: &Path) -> rusqlite::Result<Connection> {
     let conn = open_worker(path)?;
-    conn.busy_timeout(Duration::from_secs(1))?;
     // Reading the row also rejects a file that is not an Anki collection.
     conn.query_row("select 1 from col limit 1", [], |_| Ok(()))?;
     Ok(conn)
@@ -554,14 +566,33 @@ fn sample_with_cache(path: &Path, query: Query) -> Result<Option<Data>> {
     let Ok(identity) = collection_identity(path) else {
         return Ok(None);
     };
-    let guard = lock(&CACHE);
-    let Some(cache) = guard.as_ref() else {
+    let mut guard = lock(&CACHE);
+    let Some(cache) = guard.as_mut() else {
         return Ok(None);
     };
     if cache.path != path || cache.identity != identity {
         return Ok(None);
     }
-    cache.data.sample(query)
+    let (days, next_day) =
+        timing_from(&cache.data.config, query.now, query.current_west)?;
+    if next_day != cache.data.completed_day {
+        let workers = mem::take(&mut cache.workers);
+        let (completed, reused) =
+            match completed_count_parallel(path, next_day, workers) {
+                Ok(result) => result,
+                Err(error) if is_locked(&error) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+        cache.workers = reused;
+        if collection_identity(path).ok().as_ref() != Some(&cache.identity) {
+            return Ok(None);
+        }
+        cache.data.completed_day = next_day;
+        cache.data.completed = completed;
+    }
+    Ok(Some(
+        cache.data.cards.data(query, (days, cache.data.completed)),
+    ))
 }
 fn sample_without_cache(path: &Path, query: Query) -> Result<Data> {
     let mut identity = collection_identity(path)?;
@@ -1021,7 +1052,8 @@ mod tests {
         .expect("cards");
         conn.execute_batch(
             "INSERT INTO revlog (id, type) VALUES
-               (1000099000, 0), (1000099001, 3), (1000099002, 4), (1, 0);",
+               (1000099000, 0), (1000099001, 3), (1000099002, 4),
+               (1000099003, -1), (1, 0);",
         )
         .expect("revlog");
 
@@ -1183,6 +1215,53 @@ mod tests {
 
         let updated = sample(&path, true, now).expect("updated sample");
         assert_eq!(updated.new, 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sample_cache_reuses_cards_after_day_rollover() {
+        let _serial = lock(&TEST_CACHE_SERIAL);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = Path::new(".tmp")
+            .join(format!("banki-rollover-{}-{nanos}", process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("collection.anki2");
+        let crt = 1_000_000;
+        let next_day = crt + SECONDS_PER_DAY;
+        let writer = Connection::open(&path).expect("collection");
+        writer
+            .execute_batch(
+                "CREATE TABLE col (crt INTEGER);
+                 CREATE TABLE config (key TEXT PRIMARY KEY, val);
+                 CREATE TABLE cards (id INTEGER PRIMARY KEY, queue INTEGER, due INTEGER);
+                 CREATE TABLE revlog (id INTEGER, type INTEGER);",
+            )
+            .expect("schema");
+        writer
+            .execute("INSERT INTO col (crt) VALUES (?)", (crt,))
+            .expect("col row");
+        set(&writer, "schedVer", "1");
+        writer
+            .execute_batch(
+                "INSERT INTO cards (id, queue, due) VALUES
+                   (1, 2, 0), (2, 2, 1), (3, 2, 2);
+                 INSERT INTO revlog (id, type) VALUES (1000000001, 0), (1086400001, 0);",
+            )
+            .expect("rows");
+        drop(writer);
+
+        let before =
+            sample(&path, false, next_day + 60).expect("before rollover");
+        let after = sample(&path, false, next_day + SECONDS_PER_DAY + 60)
+            .expect("after rollover");
+
+        assert_eq!(before.reviews, 2);
+        assert_eq!(before.completed, 1);
+        assert_eq!(after.reviews, 3);
+        assert_eq!(after.completed, 0);
         let _ = fs::remove_dir_all(&dir);
     }
 

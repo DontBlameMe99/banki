@@ -9,8 +9,7 @@ use crate::anki;
 
 const SAMPLE_USAGE: &str =
     "usage: banki-helper sample <collection> <include_new> [at]";
-const BENCH_USAGE: &str =
-    "usage: banki-helper bench <collection> <iterations> [include_new]";
+const BENCH_USAGE: &str = "usage: banki-helper bench <collection> <iterations> [include_new] [at] [step_seconds]";
 const DEFAULT_ITERATIONS: usize = 1000;
 const MICROS_PER_SECOND: f64 = 1_000_000.0;
 
@@ -72,7 +71,22 @@ pub fn bench(args: &[String]) -> ExitCode {
         }
     };
 
-    let now = unix_seconds();
+    let mut now = unix_seconds();
+    if let Some(value) = args.get(4) {
+        let Ok(parsed) = value.parse::<i64>() else {
+            eprintln!("invalid timestamp: {value}");
+            return ExitCode::FAILURE;
+        };
+        now = parsed;
+    }
+    let mut step = 0;
+    if let Some(value) = args.get(5) {
+        let Ok(parsed) = value.parse::<i64>() else {
+            eprintln!("invalid timestamp step: {value}");
+            return ExitCode::FAILURE;
+        };
+        step = parsed;
+    }
     let mut samples = Vec::with_capacity(count.saturating_sub(1));
     let mut first = 0.0;
     for index in 0..count {
@@ -87,6 +101,7 @@ pub fn bench(args: &[String]) -> ExitCode {
         } else {
             samples.push(elapsed);
         }
+        now = now.saturating_add(step);
     }
 
     samples.sort_by(f64::total_cmp);
